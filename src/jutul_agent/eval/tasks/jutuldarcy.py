@@ -12,6 +12,7 @@ from inspect_ai import Task, task
 from inspect_ai.dataset import Sample
 
 from jutul_agent.eval.scorers import (
+    julia_code_matches,
     no_interpreters_via_execute,
     no_repeated_identical_calls,
     numeric_answer,
@@ -136,4 +137,69 @@ def jutuldarcy_unit_conversion() -> Task:
     )
 
 
-TASKS = [jutuldarcy, jutuldarcy_rate_change, jutuldarcy_unit_conversion]
+@task
+def jutuldarcy_sensitivity() -> Task:
+    """Adjoint permeability sensitivity with numerical gradient verification."""
+
+    sample = Sample(
+        id="jd-adjoint-permeability",
+        input=(
+            "Using JutulDarcy, set up and run this exact two-phase reservoir case.\n"
+            "- Grid: 20 x 20 x 1 cells over a 1000 x 1000 x 100 m domain.\n"
+            "- Rock: uniform porosity 0.2 and uniform permeability 0.1 darcy.\n"
+            "- Wells: a vertical injector at (1, 1) and a vertical producer at "
+            "(20, 20).\n"
+            "- Fluids: immiscible aqueous and vapor phases with reference densities "
+            "1000 and 700 kg/m^3.\n"
+            "- Initial state: 150 bar and fully aqueous-saturated.\n"
+            "- Schedule: 24 steps of 30 days.\n"
+            "- Injector: vapor injection on total-rate control corresponding to one "
+            "pore volume injected over the full schedule.\n"
+            "- Producer: 50 bar bottom-hole pressure.\n\n"
+            "Define J as cumulative producer surface gas production normalized by "
+            "the total injected volume, with positive J corresponding to positive "
+            "physical production.\n\n"
+            "Compute the cell-wise permeability sensitivity using JutulDarcy's "
+            "adjoint functionality. Convert the permeability gradient to dJ/dlogK, "
+            "identify the cell with the largest absolute sensitivity, and validate "
+            "that entry with a central finite-difference perturbation in log "
+            "permeability.\n\n"
+            "Report the cell index, adjoint dJ/dlogK, finite-difference dJ/dlogK, "
+            "the perturbation size, and relative error."
+        ),
+        metadata={
+            "needs_env": True,
+            "expected": (
+                "largest absolute log-permeability sensitivity at cell 7; "
+                "adjoint dJ/dlogK about -6.47888e-4; "
+                "finite-difference result about -6.47865e-4 at epsilon 1e-3; "
+                "relative error about 3.43e-5"
+            ),
+        },
+    )
+
+    return Task(
+        dataset=[sample],
+        solver=jutul_agent_solver(simulator="jutuldarcy"),
+        scorer=[
+            # Trusted baseline from the manually verified JutulDarcy run.
+            numeric_close(-6.478876098425024e-4, 5e-6),
+            # The important cell should be identified correctly.
+            numeric_close(7.0, 0.1),
+            # The reported gradient check should reach the validated error scale.
+            numeric_close(3.427369846771903e-5, 1e-5),
+            # Require actual adjoint execution, not merely a textual claim.
+            julia_code_matches(r"reservoir_sensitivities\s*\("),
+            # Accept Jutul's finite-difference helper or an explicit perturbation.
+            julia_code_matches(r"(finite_difference_gradient_entry\s*\(|exp\s*\()"),
+            used_tools(["run_julia"]),
+            no_interpreters_via_execute(),
+            no_repeated_identical_calls(),
+        ],
+        time_limit=3000,
+        token_limit=2_000_000,
+        message_limit=120,
+    )
+
+
+TASKS = [jutuldarcy, jutuldarcy_rate_change, jutuldarcy_unit_conversion, jutuldarcy_sensitivity]

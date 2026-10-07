@@ -462,6 +462,7 @@ def test_suite_modules_expose_all_tasks_via_tasks_list() -> None:
         "jutuldarcy",
         "jutuldarcy_rate_change",
         "jutuldarcy_unit_conversion",
+        "jutuldarcy_sensitivity",
     ]
     assert [f.__name__ for f in mocca.TASKS] == ["mocca", "mocca_honesty"]
     for factory in (*battmo.TASKS, *jutuldarcy.TASKS, *mocca.TASKS):

@@ -1,0 +1,7 @@
+{
+  "J": 0.0252095334469545,
+  "eps_ref": 0.0006531881622825464,
+  "max_abs_gradient": 0.0006442554154370411,
+  "accepted_top_cells": [385],
+  "jutuldarcy_version": "0.3.11"
+}

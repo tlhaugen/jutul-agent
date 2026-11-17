@@ -1,6 +1,6 @@
 ---
 name: jutuldarcy-sensitivities
-description: Compute, validate, and interpret parameter sensitivities in JutulDarcy using adjoint and numerical gradients
+description: Compute, verify, and interpret parameter sensitivities in JutulDarcy using adjoint gradients and finite-difference checks, including directional checks that cover well cells
 ---
 
 # JutulDarcy sensitivity analysis
@@ -23,6 +23,7 @@ A reliable sensitivity analysis has three parts:
 3. verify and interpret it.
 
 Do not report a gradient as reliable merely because an adjoint call completed.
+A gradient can be finite, plausible, and still wrong or incomplete.
 
 ## 1. Identify the quantity of interest and parameter
 
@@ -66,17 +67,21 @@ smooth alternative when appropriate.
 
 Check sign conventions before interpreting the gradient.
 
-In particular, production rates may use a negative sign convention. A negative
-objective representing positive physical production can therefore reverse the
-meaning of every gradient sign.
+Production rates use a negative sign convention in JutulDarcy. A negative
+objective representing positive physical production reverses the meaning of
+every gradient sign.
+
+Check the sign of `J` against its physical meaning, not only against finite
+differences. If the adjoint objective and the finite-difference calculation
+use the same wrong sign, they agree and the error is not detected.
 
 Do not silently change the objective sign. Define the objective explicitly and
 state what increasing `J` means physically.
 
-## 3. Reuse and validate the forward problem
+## 3. Validate the forward problem
 
-Prefer reusing the model, state, parameters, timestep schedule, forces, and
-simulation results already present in the persistent Julia REPL.
+The base simulation, its model, state, parameters, schedule and forces may be
+reused from the persistent Julia session for the adjoint computation.
 
 If a new case is required, follow the `jutuldarcy-overview` and
 `jutuldarcy-wells` skills.
@@ -89,6 +94,9 @@ The forward problem must be valid before sensitivities are computed:
 - inspect the quantity of interest.
 
 Do not continue to gradient interpretation when the forward solve is invalid.
+
+Reuse applies to the base run only. Every perturbed simulation used for
+verification must be built from a new case (see section 7).
 
 ## 4. Inspect the installed sensitivity API
 
@@ -134,7 +142,29 @@ After computing a gradient, check at least:
 - an overall scale such as the gradient norm.
 
 For spatial parameter fields, preserve the mapping from gradient entries to
-reservoir cells.
+reservoir cells, and report cell positions both as linear index and as
+Cartesian index when the grid is structured.
+
+### Derived quantities may be missing from the gradient
+
+An input parameter such as permeability often enters the discrete equations
+only through derived quantities, for example face transmissibilities and well
+indices. The adjoint function may not propagate every derived quantity back to
+the input parameter. In particular, a permeability gradient may hold the well
+indices fixed, so that the sensitivity in perforated cells is incomplete, while
+a perturbed simulation that rebuilds the case changes them.
+
+Inspect the returned sensitivity structure for entries belonging to the well
+models, such as well-index sensitivities. If they are present and the well
+index depends on the parameter, the full sensitivity in a perforated cell is
+
+    dJ/dlogK_c = (dJ/dlogK_c with well indices fixed) + (dWI_c/dlogK_c) * dJ/dWI_c
+
+For an isotropic Peaceman well index, `WI_c` is proportional to `K_c`, so
+`dWI_c/dlogK_c = WI_c`.
+
+Either apply this correction or report clearly that the gradient holds well
+indices fixed. The directional check in section 7 detects the difference.
 
 ## 6. Use an interpretable parameterization
 
@@ -154,14 +184,26 @@ conversion.
 
 State clearly which gradient is being reported.
 
-## 7. Verify representative entries numerically
+## 7. Verify the gradient numerically
 
-Numerical verification is part of the sensitivity workflow.
+Numerical verification is part of the sensitivity workflow. It has two parts,
+component checks and a directional check, and both are needed. Component checks
+can locate an error, but only test the entries that are checked. A directional
+check tests all entries at once.
 
 Prefer Jutul's installed finite-difference or optimization utilities when they
-apply. Inspect their current signatures before calling them.
+apply. Inspect their current signatures before calling them. Otherwise use
+central finite differences.
 
-Otherwise use a central finite difference.
+### Rebuild every perturbed case
+
+When a parameter changes, every quantity derived from it must be recomputed,
+including transmissibilities and well indices. Build each perturbed simulation
+from a new case with the perturbed parameter. Do not perturb a parameter array
+inside a model object from an earlier tool call, since that object can still
+hold quantities derived from the unperturbed values.
+
+### Component checks
 
 For log-permeability, perturb one component with:
 
@@ -170,27 +212,52 @@ For log-permeability, perturb one component with:
 
 and estimate:
 
-    dJ/dlogK_i ≈
-        (J(K_i_plus) - J(K_i_minus)) / (2 * epsilon)
+    dJ/dlogK_i ≈ (J(K_i_plus) - J(K_i_minus)) / (2 * epsilon)
 
-When permeability changes, ensure that model quantities derived from
-permeability, including transmissibilities, are recomputed. Do not perturb a
-permeability array while accidentally reusing stale derived quantities.
+Check a representative subset that includes:
 
-For each checked component, report:
+- the largest entries,
+- at least one entry close to zero,
+- every cell perforated by a well.
 
-- cell or parameter index,
-- adjoint gradient,
-- finite-difference gradient,
-- relative error,
-- perturbation size.
+### Directional check
 
-When practical, test more than one `epsilon`. Decreasing error followed by a
-plateau is usually more informative than a single finite-difference result.
+Choose a random unit vector `v` over all parameter components, including well
+cells. Perturb all components at once, `logK + epsilon * v` and
+`logK - epsilon * v`, and compare
 
-For a large parameter field, validate a representative subset rather than every
-entry. Include important high-sensitivity entries and, when useful, lower-
-sensitivity entries from other regions.
+    (J(logK + epsilon * v) - J(logK - epsilon * v)) / (2 * epsilon)
+
+with the adjoint prediction `dot(grad, v)`. If the component checks agree but
+the directional check does not, the error lies in components that were not
+checked, often in perforated cells.
+
+### Measuring the error
+
+Measure errors relative to the largest gradient component,
+
+    e = |g_FD - g_adj| / max_i |g_adj_i|
+
+since the relative error of a single component is not meaningful when the
+component is close to zero. For the directional check, the relative error
+`|D_FD - D_adj| / |D_adj|` is appropriate.
+
+Test several perturbation sizes, for example `epsilon = 1e-1, 1e-2, ..., 1e-6`.
+The error should decrease and then either level off or grow again. A level
+plateau usually reflects solver tolerances. To test this, repeat the comparison
+with tightened nonlinear and linear tolerances. The plateau level is an estimate
+of how accurately the gradient can be verified.
+
+If two components differ by less than this accuracy, do not claim that one of
+them is larger. Report both.
+
+For each check, report:
+
+- cell index or direction,
+- adjoint value,
+- finite-difference value,
+- error `e`,
+- perturbation sizes used.
 
 ## 8. Interpret the gradient physically
 
@@ -206,12 +273,17 @@ For important sensitivities, explain:
 
 For spatial permeability sensitivities, relate important cells to wells,
 connectivity, and expected flow paths when the model supports that
-interpretation.
+interpretation. Look at the whole field, not only the largest entries. Regions
+of opposite sign can cancel when a whole region is perturbed, so the effect of
+a regional change is the sum of its cell sensitivities, not the largest one.
 
 Be careful with magnitude comparisons. A very large raw `dJ/dK` can simply
 reflect that permeability is numerically very small in SI units. Prefer
 log-parameterized or otherwise normalized sensitivities when comparing
 importance across cells.
+
+The gradient is local. It predicts the effect of small changes and does not
+necessarily predict the effect of large ones.
 
 ## 9. Report reliability and limitations
 
@@ -224,25 +296,30 @@ Report relevant items such as:
 - objective sign convention,
 - differentiated parameter,
 - parameterization,
+- whether well indices and other derived quantities are included in the gradient,
 - forward-solve status,
-- numerical gradient-check error,
-- finite-difference step size,
+- component-check and directional-check errors,
+- finite-difference step sizes,
+- the estimated verification accuracy,
 - assumptions made during interpretation.
 
-Treat a large disagreement between adjoint and finite differences as a problem
-to investigate, not something to hide.
+Treat a disagreement between adjoint and finite differences as a problem to
+investigate, not something to hide.
 
 Possible causes include:
 
 - comparing different parameterizations,
-- incorrect objective definition,
+- incorrect objective definition or sign,
 - stale model quantities after a perturbation,
+- derived quantities, such as well indices, held fixed in the adjoint gradient,
 - finite-difference step size that is too large or too small,
-- nonlinear solver tolerances,
-- convergence differences between perturbed runs,
+- nonlinear or linear solver tolerances,
+- convergence or time-step differences between perturbed runs,
 - an API mismatch or incorrect extraction of the gradient.
 
-Do not claim a gradient is validated until these issues have been checked.
+Do not claim a gradient is validated until both component checks and a
+directional check agree within the estimated accuracy. If a discrepancy cannot
+be resolved, report the result as not validated and state what was checked.
 
 ## Recommended workflow
 
@@ -250,15 +327,16 @@ For a typical sensitivity request:
 
 1. Inspect or construct the forward case.
 2. Validate and run it.
-3. Define the scalar objective `J`.
+3. Define the scalar objective `J` and check its sign against its physical meaning.
 4. Identify parameter `p` and parameterization.
 5. Locate the installed adjoint API.
-6. Compute the gradient.
-7. Check its dimensions and numerical sanity.
-8. Validate selected entries numerically.
-9. Convert or normalize the gradient when useful.
-10. Interpret the important entries physically.
-11. Report assumptions, validation error, and limitations.
+6. Compute the gradient and check its dimensions and numerical sanity.
+7. Check whether derived quantities such as well indices are included, and correct or report this.
+8. Convert or normalize the gradient when useful.
+9. Verify the largest entries, an entry close to zero and the well cells, each from a rebuilt case.
+10. Verify the whole gradient with a directional check.
+11. Interpret the field physically.
+12. Report assumptions, verification errors and limitations.
 
 Prefer evidence from the running model, installed source, and numerical checks
 over assumptions about what the API or physics should do.

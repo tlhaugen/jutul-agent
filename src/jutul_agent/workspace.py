@@ -324,6 +324,126 @@ def ensure_env_template_stamp(env_dir: Path, template_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Simulator version floors (an upgrade must not run against an outdated env).
+
+Version = tuple[int, int, int]
+
+
+def _version(text: str) -> Version | None:
+    """``"0.3.12"`` (or ``"0.4.1-DEV"``) as a comparable tuple, or ``None``."""
+
+    parts = text.split("-")[0].split("+")[0].split(".")
+    if not parts or len(parts) > 3 or not all(p.isdigit() for p in parts):
+        return None
+    numbers = [int(p) for p in parts] + [0] * (3 - len(parts))
+    return numbers[0], numbers[1], numbers[2]
+
+
+def compat_ranges(spec: str) -> list[tuple[Version, Version]] | None:
+    """Half-open ranges of a Julia ``[compat]`` entry, or ``None`` if not understood.
+
+    Handles the caret form the templates use (``"0.4"``, ``"^0.5.4"``, and comma
+    separated unions): the first nonzero component may not change, so ``"0.4"``
+    is ``[0.4.0, 0.5.0)`` and ``"1.2"`` is ``[1.2.0, 2.0.0)``.
+    """
+
+    ranges = []
+    for part in spec.split(","):
+        part = part.strip().removeprefix("^")
+        low = _version(part)
+        if low is None or "-" in part or "+" in part:
+            return None
+        given = [int(p) for p in part.split(".")]
+        bump = next((i for i, n in enumerate(given) if n != 0), len(given) - 1)
+        high = given[: bump + 1]
+        high[bump] += 1
+        high += [0] * (3 - len(high))
+        ranges.append((low, (high[0], high[1], high[2])))
+    return ranges
+
+
+def _manifest_entries(env_dir: Path) -> dict[str, dict]:
+    """Each package's manifest entry, keyed by name (format 1 and 2)."""
+
+    try:
+        data = tomllib.loads((env_dir / "Manifest.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    packages = data.get("deps", data)
+    return {
+        name: entries[0]
+        for name, entries in packages.items()
+        if isinstance(entries, list) and entries and isinstance(entries[0], dict)
+    }
+
+
+def resolved_package_version(env_dir: Path, package: str) -> str | None:
+    """The version of ``package`` the env's manifest resolved, if any."""
+
+    version = _manifest_entries(env_dir).get(package, {}).get("version")
+    return str(version) if version is not None else None
+
+
+def _env_versions_against_template(
+    env_dir: Path, template_path: Path
+) -> tuple[list[tuple[str, str, str]], list[tuple[str, str, str]]]:
+    """Packages ``env_dir`` resolved below, and above, the template's ``[compat]``.
+
+    Each list holds ``(package, resolved version, template compat)``. A package the
+    env has not resolved is not checked: the install step handles it. Nor is
+    anything once a package the template bounds is a local checkout (a manifest
+    ``path``, as ``init --source-path`` sets up): a developer working on the
+    simulator, or on what it builds on, manages these versions, and the checkout's
+    own bounds may differ from the template's on purpose.
+    """
+
+    try:
+        compat = tomllib.loads((template_path / "Project.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return [], []
+    entries = _manifest_entries(env_dir)
+    bounded = compat.get("compat", {})
+    if any("path" in entries.get(package, {}) for package in bounded):
+        return [], []
+    older, newer = [], []
+    for package, spec in bounded.items():
+        entry = entries.get(package)
+        ranges = compat_ranges(spec) if isinstance(spec, str) else None
+        if package == "julia" or entry is None or ranges is None:
+            continue
+        version = _version(str(entry.get("version", "")))
+        if version is None or any(low <= version < high for low, high in ranges):
+            continue
+        found = (package, str(entry["version"]), spec)
+        # Past every range is newer; anything else (below, or in a gap of a union
+        # like "0.3, 0.5") is behind what this install supports.
+        (newer if version >= max(high for _, high in ranges) else older).append(found)
+    return older, newer
+
+
+def outdated_env_packages(env_dir: Path, template_path: Path) -> list[tuple[str, str, str]]:
+    """Packages ``env_dir`` resolved older than the installed template supports.
+
+    Returns ``(package, resolved version, required compat)`` for each. These are
+    what an update moves forward. A newer package is not here: see
+    ``newer_env_packages``.
+    """
+
+    return _env_versions_against_template(env_dir, template_path)[0]
+
+
+def newer_env_packages(env_dir: Path, template_path: Path) -> list[tuple[str, str, str]]:
+    """Packages ``env_dir`` resolved newer than the installed template was made for.
+
+    A simulator developer trying an unreleased or just-released version gets here,
+    as does a folder a newer jutul-agent set up. It runs, with a note: nothing
+    refuses it, and nothing moves it back.
+    """
+
+    return _env_versions_against_template(env_dir, template_path)[1]
+
+
+# ---------------------------------------------------------------------------
 # Path helpers.
 
 

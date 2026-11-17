@@ -1,6 +1,6 @@
 """Julia plotting tools: capture Makie figures as session artifacts.
 
-Plotting always runs on GLMakie. The tool opens a live window for the user only
+Native plotting runs on GLMakie. The tool opens a live window for the user only
 when the session can show one (an interactive run with a display); otherwise it
 renders offscreen to a PNG. Headless Linux still renders, via the xvfb-wrapped
 Julia process (see the kernel). If GLMakie cannot load at all, the tool
@@ -115,17 +115,10 @@ async def _load_agent_runtime(session: Session) -> str | None:
 async def _load_web_plot_backend(session: Session, adapter: SimulatorAdapter) -> str | None:
     """Load the web plotting backends once: WGLMakie + Bonito, plus GLMakie.
 
-    The web surface renders figures into the browser with WebGL (WGLMakie) instead
-    of a native window. GLMakie is also imported, not to render, but so the
-    simulator's native plotters (whose methods live in Jutul/JutulDarcy's GLMakie
-    extension, e.g. ``plot_reservoir``'s 3D mesh and well trajectories) are defined;
-    those methods dispatch on backend-agnostic Makie types, so WGLMakie renders
-    them to the browser. CairoMakie gives a static PNG for the record.
-
-    GLMakie needs a GL context to load (a real display, or the Xvfb the server
-    starts); if it can't load, native plotters are unavailable but inline Makie
-    figures (built by the agent) still render interactively, so its failure is a
-    warning, not an error.
+    The web surface builds and renders figures with WGLMakie. The shared
+    runtime also loads GLMakie for native captures and other simulators whose
+    plotters use GLMakie extensions. CairoMakie supplies the provisional PNG
+    poster.
     """
 
     # The live figures are held by JutulAgent.JutulAgentPlots, so this surface needs the
@@ -143,8 +136,8 @@ async def _load_web_plot_backend(session: Session, adapter: SimulatorAdapter) ->
             f"`jutul-agent init --sim {adapter.name} --force`. Julia said: "
             f"{_truncate(loaded.error, 300)}"
         )
-    # Best-effort: enables native plotters when a GL context is available.
-    await session.julia.eval(jl.IMPORT_GLMAKIE_OFFSCREEN)
+    # Retain compatibility with other simulators that use GLMakie extensions.
+    await session.julia.eval(jl.IMPORT_GLMAKIE)
     # Both guards patch over upstream bugs, once per session and before any figure is
     # built. Each reports whether it took: when the method it replaces moves upstream it
     # stops applying silently, and the only symptom is a mouse button that no longer works
@@ -313,6 +306,13 @@ def _finalize_web(
     return _reply(summary, png_abs, view and has_poster)
 
 
+def note_live_routes(session: Session, output: str | None) -> None:
+    """Keep the routes the kernel reported it still serves (``LIVE_ROUTES_MARKER``)."""
+    match = re.search(rf"{jl.LIVE_ROUTES_MARKER}=(.*)", output or "")
+    if match is not None:
+        session.live_routes = set(match.group(1).split())
+
+
 def _parse_size(output: str | None, marker: str = jl.FIG_SIZE_MARKER) -> list[int] | None:
     """A figure pixel size read back from a tagged echo line: the resulting
     size by default, or the authored size via ``jl.FIG_AUTHORED_MARKER``."""
@@ -422,7 +422,9 @@ async def replot_web(
         return err, None, None
     # Idempotent: an existing server answers with its real port, a fresh kernel
     # gets one started. Either way the reverse proxy learns where to dial.
-    started = await session.julia.eval(jl.web_server_start(_free_port(), session.session_id))
+    started = await session.julia.eval(
+        jl.web_server_start(_free_port(), session.session_id, base_path=session.base_path)
+    )
     match = re.search(r"__JUTUL_WEB_PORT__=(\d+)", started.output or "")
     if started.error or match is None:
         reason = _truncate(started.error or "the server did not report a port", 200)
@@ -446,6 +448,7 @@ async def replot_web(
             poster=record,
         )
     )
+    note_live_routes(session, result.output)
     if result.error:
         return f"the plot code failed when re-run: {_truncate(result.error, 300)}", None, None
     size_px = _parse_size(result.output)
@@ -496,6 +499,7 @@ def make_plot_julia_tool(session: Session, *, surface: str | None = None):
             if flags is None or flags.group(2) != "true":
                 live_base = None
                 session.web_plot_port = None
+                session.live_routes = set()
         if not backend_loaded:
             loader = _load_web_plot_backend if web else _load_plot_backend
             err = await loader(session, adapter)
@@ -504,7 +508,7 @@ def make_plot_julia_tool(session: Session, *, surface: str | None = None):
             backend_loaded = True
         if web and live_base is None:
             started = await session.julia.eval(
-                jl.web_server_start(_free_port(), session.session_id)
+                jl.web_server_start(_free_port(), session.session_id, base_path=session.base_path)
             )
             # The server prints its bound port on a uniquely-tagged line; read that
             # rather than scanning for digits (a startup log line could carry others).
@@ -550,8 +554,10 @@ def make_plot_julia_tool(session: Session, *, surface: str | None = None):
         Prefer your simulator's documented native plotters (the `plotting-basics` and
         per-simulator skills name them); otherwise build a `Figure` inline. Just run
         the code: you don't need to return a `Figure` or avoid `display`, since the
-        tool captures whatever figure your code produced. Plotting runs on GLMakie
-        like normal Julia.
+        tool captures whatever figure your code produced. It selects WGLMakie for
+        the web interface and GLMakie for native capture; do not activate a backend
+        yourself. Keep native viewer controls unless the user requests a static
+        figure or a custom view.
 
         Give related plots a stable `slot`: the same `slot` refreshes one window
         in place (good for iterating), distinct slots get distinct windows, and
@@ -618,6 +624,7 @@ def make_plot_julia_tool(session: Session, *, surface: str | None = None):
                 )
                 live_url = None
             result = await session.julia.eval(call)
+            note_live_routes(session, result.output)
             if result.error:
                 return f"ERROR: {result.error}"
             return _finalize_web(
@@ -769,6 +776,7 @@ def make_close_plots_tool(session: Session, *, surface: str | None = None):
             return slot_err
         make_call = jl.close_web_plots_call if web else jl.close_windows_call
         result = await session.julia.eval(make_call(safe_slot or ""))
+        note_live_routes(session, result.output)
         if result.error:
             return f"ERROR: {result.error}"
         return f"closed plot: {safe_slot}" if safe_slot else "closed all plots"

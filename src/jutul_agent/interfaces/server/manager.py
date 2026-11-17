@@ -77,6 +77,8 @@ class SessionLaunchDefaults:
     add_dirs: tuple[Path, ...] = ()
     ephemeral_memory: bool = False
     sysimage: bool | None = None
+    # Public URL prefix (e.g. ``/restricted``); see ``Session.base_path``.
+    base_path: str = ""
 
 
 def make_host_factory(defaults: SessionLaunchDefaults | None = None) -> HostFactory:
@@ -101,7 +103,7 @@ def make_host_factory(defaults: SessionLaunchDefaults | None = None) -> HostFact
         from jutul_agent.simulators import registry
 
         adapter = registry.get(sim)
-        return await SessionHost.start(
+        host = await SessionHost.start(
             simulator=adapter,
             surface="web",
             model=model,
@@ -117,6 +119,8 @@ def make_host_factory(defaults: SessionLaunchDefaults | None = None) -> HostFact
             ephemeral_memory=launch.ephemeral_memory,
             sysimage=launch.sysimage,
         )
+        host.session.base_path = launch.base_path
+        return host
 
     return factory
 
@@ -136,6 +140,9 @@ class SessionManager:
         self._hosts: OrderedDict[str, SessionHost] = OrderedDict()
         self._lock = asyncio.Lock()
         self._max_live = max(1, _configured_max_live() if max_live is None else max_live)
+        # Sessions being stood up right now: not registered yet, but already
+        # preparing the Julia environment and starting a kernel.
+        self._starting = 0
 
     async def create(
         self,
@@ -146,15 +153,19 @@ class SessionManager:
         workspace: Any | None = None,
         extensions: Sequence[Capability] = (),
     ) -> SessionHost:
-        host = await self._host_factory(
-            sim=sim,
-            model=model,
-            approval_mode=approval_mode,
-            workspace=workspace,
-            resume=False,
-            session_id=None,
-            extensions=extensions,
-        )
+        self._starting += 1
+        try:
+            host = await self._host_factory(
+                sim=sim,
+                model=model,
+                approval_mode=approval_mode,
+                workspace=workspace,
+                resume=False,
+                session_id=None,
+                extensions=extensions,
+            )
+        finally:
+            self._starting -= 1
         await self._register(host)
         return host
 
@@ -168,15 +179,19 @@ class SessionManager:
         workspace: Any | None = None,
         extensions: Sequence[Capability] = (),
     ) -> SessionHost:
-        host = await self._host_factory(
-            sim=sim,
-            model=model,
-            approval_mode=approval_mode,
-            workspace=workspace,
-            resume=True,
-            session_id=session_id,
-            extensions=extensions,
-        )
+        self._starting += 1
+        try:
+            host = await self._host_factory(
+                sim=sim,
+                model=model,
+                approval_mode=approval_mode,
+                workspace=workspace,
+                resume=True,
+                session_id=session_id,
+                extensions=extensions,
+            )
+        finally:
+            self._starting -= 1
         await self._register(host)
         return host
 
@@ -243,6 +258,10 @@ class SessionManager:
 
     def list_ids(self) -> list[str]:
         return list(self._hosts)
+
+    def any_busy(self) -> bool:
+        """Whether a session is starting, or any live one is running a turn."""
+        return self._starting > 0 or any(host.busy for host in self._hosts.values())
 
     async def close(self, session_id: str, *, require_idle: bool = False) -> bool:
         """Close and unregister a session; ``False`` if it was not registered.

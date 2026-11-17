@@ -200,6 +200,49 @@ def test_disk_resume_reports_stale_sysimage_as_conflict(tmp_path: Path) -> None:
     assert "--no-sysimage" in response.json()["detail"]
 
 
+@pytest.mark.parametrize("endpoint", ["create", "resume"])
+def test_outdated_environment_is_a_conflict_not_a_server_error(
+    tmp_path: Path, endpoint: str
+) -> None:
+    """The page shows the explanation instead of waiting on a failed request."""
+    from jutul_agent.simulators.env_setup import EnvSetupError
+
+    async def outdated_factory(**_kwargs) -> SessionHost:
+        raise EnvSetupError("has JutulDarcy 0.3.12, but requires JutulDarcy 0.4")
+
+    manager = SessionManager(host_factory=outdated_factory)
+    app = create_app(manager, default_sim="jutuldarcy", default_model="ollama:qwen3")
+    with TestClient(app) as client:
+        if endpoint == "create":
+            response = client.post("/sessions", json={})
+        else:
+            response = client.post(f"/sessions/{default_session_id()}/resume", json={})
+
+    assert response.status_code == 409
+    assert "requires JutulDarcy 0.4" in response.json()["detail"]
+
+
+def test_version_reports_the_install_and_the_simulator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from jutul_agent import update_check
+
+    env = tmp_path / "env"
+    env.mkdir()
+    (env / "Manifest.toml").write_text('[[deps.JutulDarcy]]\nversion = "0.4.0"\n', encoding="utf-8")
+    monkeypatch.setattr(update_check, "refresh_if_stale", lambda: None)
+    monkeypatch.setattr(update_check, "pending_update", lambda: "9.9.9")
+    app = create_app(_manager(echo_agent, tmp_path), default_sim="jutuldarcy", julia_project=env)
+    with TestClient(app) as client:
+        info = client.get("/version").json()
+    assert info["jutul_agent"] and "+" not in info["jutul_agent"]
+    assert info["simulator"] == {"package": "JutulDarcy", "version": "0.4.0"}
+    assert info["update"] == "9.9.9"
+    monkeypatch.setenv(update_check.DISABLE_ENV_VAR, "1")
+    with TestClient(app) as client:
+        assert client.get("/version").json()["update"] is None
+
+
 @pytest.mark.parametrize(
     ("model", "env_var"),
     [
@@ -347,9 +390,9 @@ async def test_launch_defaults_reach_session_host_start(monkeypatch, tmp_path: P
 
     captured: dict[str, Any] = {}
 
-    async def fake_start(**kwargs: Any) -> str:
+    async def fake_start(**kwargs: Any) -> SimpleNamespace:
         captured.update(kwargs)
-        return "host"
+        return SimpleNamespace(session=SimpleNamespace())
 
     monkeypatch.setattr(manager_mod.SessionHost, "start", staticmethod(fake_start))
     monkeypatch.setattr("jutul_agent.simulators.registry.get", lambda name: f"adapter:{name}")
@@ -360,9 +403,10 @@ async def test_launch_defaults_reach_session_host_start(monkeypatch, tmp_path: P
             threads="3",
             add_dirs=(tmp_path / "extra",),
             ephemeral_memory=True,
+            base_path="/restricted",
         )
     )
-    await factory(
+    host = await factory(
         sim="demo",
         model=None,
         approval_mode=None,
@@ -376,6 +420,7 @@ async def test_launch_defaults_reach_session_host_start(monkeypatch, tmp_path: P
     assert captured["add_dirs"] == (tmp_path / "extra",)
     assert captured["julia_project"] == tmp_path / "proj"
     assert captured["prepare_env"] is False
+    assert host.session.base_path == "/restricted"
 
     await make_host_factory()(
         sim="demo",
@@ -389,7 +434,10 @@ async def test_launch_defaults_reach_session_host_start(monkeypatch, tmp_path: P
     assert captured["prepare_env"] is True
 
 
-async def test_start_wires_surface_and_capability_dependencies(monkeypatch, tmp_path: Path) -> None:
+@pytest.mark.parametrize("surface", ["tui", "web"])
+async def test_start_wires_surface_and_capability_dependencies(
+    monkeypatch, tmp_path: Path, surface: str
+) -> None:
     """``SessionHost.start`` threads ``surface`` into the ``Session`` it creates,
     and merges discovered + passed-in capabilities' dependency paths into the
     ``prepare_workspace_env`` call — both added in this branch alongside the
@@ -408,7 +456,12 @@ async def test_start_wires_surface_and_capability_dependencies(monkeypatch, tmp_
 
     monkeypatch.setattr(requirements_mod, "require_julia", lambda *a, **kw: None)
     monkeypatch.setattr(juliakernel_mod, "JuliaKernel", lambda config: FakeJulia())
-    monkeypatch.setattr(warmup_mod, "start_warmup", lambda *a, **kw: None)
+    warmup_calls = {}
+
+    def _fake_warmup(*args, **kwargs):
+        warmup_calls.update(kwargs)
+
+    monkeypatch.setattr(warmup_mod, "start_warmup", _fake_warmup)
     monkeypatch.setattr(builder_mod, "resolve_package_sources", lambda project: [])
 
     discovered_dep = tmp_path / "DiscoveredCap" / "Project.toml"
@@ -437,13 +490,14 @@ async def test_start_wires_surface_and_capability_dependencies(monkeypatch, tmp_
         simulator=adapter,
         workspace=workspace,
         state_root=tmp_path,
-        surface="tui",
+        surface=surface,
         extensions=[passed_cap],
     )
     try:
         assert prepare_calls["dependencies"] == [discovered_dep, passed_dep]
-        assert host.session.surface == "tui"
-        assert build_calls["surface"] == "tui"
+        assert host.session.surface == surface
+        assert build_calls["surface"] == surface
+        assert warmup_calls["native_plotting"] is (surface != "web")
         assert discovered_cap in build_calls["extensions"]
         assert passed_cap in build_calls["extensions"]
     finally:
@@ -897,6 +951,43 @@ def test_artifact_wire_events_replay_falls_back_to_poster() -> None:
         "width": 1600,
         "height": 900,
     }
+
+
+def test_artifact_wire_events_replays_only_figures_still_served() -> None:
+    # A live session's server may have dropped a figure since it was recorded (the
+    # agent closed it, or the route cap released it): that one shows its poster.
+    def payload(slot: str) -> dict:
+        return {
+            "path": f"artifacts/{slot}.png",
+            "mime": "image/png",
+            "kind": "plot",
+            "poster": f"artifacts/{slot}.png",
+            "slot": slot,
+            "live_url": f"/live/sid/viz/{slot}",
+        }
+
+    kept, dropped = artifact_wire_events(
+        [payload("kept"), payload("dropped")], "sid", live=True, live_routes={"/viz/kept"}
+    )
+    assert kept["live"] is True and kept["url"] == "/live/sid/viz/kept"
+    assert dropped["live"] is False and dropped["url"] == "/sessions/sid/artifacts/dropped.png"
+
+
+def test_artifact_wire_events_prefixes_base_path() -> None:
+    payloads = [
+        {
+            "path": "artifacts/scene.html",
+            "mime": "text/html",
+            "caption": "interactive",
+            "kind": "plot",
+            "poster": "artifacts/scene.png",
+            "live_url": "/live/sid/viz/scene",
+            "source_code": "lines(1:10)",
+        },
+    ]
+    (event,) = artifact_wire_events(payloads, "sid", base_path="/restricted")
+    assert event["url"] == "/restricted/live/sid/viz/scene"
+    assert event["poster"] == "/restricted/sessions/sid/artifacts/scene.png"
 
 
 def _plot_eval_handler(code: str):

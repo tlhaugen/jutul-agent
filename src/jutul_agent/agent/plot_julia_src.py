@@ -6,7 +6,7 @@ code generation here, apart from the tool orchestration (tracing, the artifact
 record, the model-facing reply), means every piece of Julia the plotting tools
 run lives in one place and the Python side reads as plain control flow.
 
-Two render paths share one figure-resolution preamble:
+The tools have two render paths:
 
 - the native **GLMakie** path (``render_call``) used by the terminal, which
   captures the figure to a PNG and optionally opens a live window, and
@@ -17,15 +17,12 @@ Two render paths share one figure-resolution preamble:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
-# Import GLMakie offscreen so the simulator's native plotters (their methods live
-# in GLMakie's Makie extension) are defined, without ever popping a desktop window.
-# Best-effort: with no GL context GLMakie can't load, so native plotters are
-# unavailable, but inline WGLMakie figures still render.
-IMPORT_GLMAKIE_OFFSCREEN = (
-    "try; @eval import GLMakie; GLMakie.activate!(visible = false); catch; end"
-)
+# Some simulators still expose plotters through GLMakie extensions. Importing
+# loads those methods; web figures are constructed and rendered with WGLMakie.
+IMPORT_GLMAKIE = "try; @eval import GLMakie; catch; end"
 
 
 # ``Makie.getscreen`` hands out closed screens: it takes the *first* screen matching the
@@ -40,7 +37,8 @@ IMPORT_GLMAKIE_OFFSCREEN = (
 # would be the better fix, but it has to key on a session that is *definitively* closed,
 # pruning on ``isopen`` also deletes screens that are merely still connecting, which was
 # measured to take the live view down. So this prefers rather than prunes, and falls back
-# to the first match when nothing is open.
+# to the newest match when nothing is open. A browser reload can briefly leave
+# two open screens, so the newest open one is the current interaction target.
 SCREEN_PREFERENCE_MARKER = "__JUTUL_SCREEN_PREF__"
 
 PREFER_OPEN_SCREEN_GUARD = (
@@ -52,10 +50,10 @@ PREFER_OPEN_SCREEN_GUARD = (
     "            parentmodule(typeof(screen)) === backend\n"
     "        end\n"
     "        isempty(matches) && return nothing\n"
-    "        for screen in matches\n"
+    "        for screen in Iterators.reverse(matches)\n"
     "            isopen(screen) && return screen\n"
     "        end\n"
-    "        return first(matches)\n"
+    "        return last(matches)\n"
     "    end\n"
     # Resolve the call the way a scene lookup does. If dispatch still lands in Makie's
     # own file, the signature moved and the replacement is inert.
@@ -130,6 +128,13 @@ def plot_state_probe(web: bool) -> str:
             ' ",", isdefined(Main, :__JUTUL_WEB_FIGS__))'
         )
     return f'println("{PLOT_STATE_MARKER}=", isdefined(Main, :GLMakie), ",true")'
+
+
+# Printed after the live figure registry changes: the routes the kernel still
+# serves, space-separated. The session keeps this list so a replay offers a live
+# view only of a figure that still exists; the rest show their posters.
+LIVE_ROUTES_MARKER = "__JUTUL_LIVE_ROUTES__"
+_PRINT_LIVE_ROUTES = f'    println("{LIVE_ROUTES_MARKER}=", join(Main.__JUTUL_WEB_ORDER__, " "))\n'
 
 
 # Printed before any fit or resize touches the figure: the size its code built
@@ -337,117 +342,28 @@ def render_call(
 
 
 def _web_figure_block(user_code: str) -> str:
-    """Shared Julia preamble for the web render paths: activate an offscreen
-    backend, run the user code, and resolve its result to a Makie ``_fig`` (error
-    if none).
+    """Build the figure with WGLMakie active and capture ordinary display calls.
 
-    An *offscreen* backend is active while the user code runs, because a native
-    plotter may call ``display(fig)`` internally and with WGLMakie active that pops
-    a browser tab (the figure then also lands in the canvas a moment later, via the
-    route below). GLMakie offscreen, loaded for its native-plotter methods anyway,
-    absorbs the display the way the terminal path does; CairoMakie is the fallback
-    when there is no GL context. WGLMakie is activated by the caller, after the
-    figure is built, only to route/export it. The Figure is backend-agnostic, so it
-    still renders as an interactive WebGL view once routed. Both the static-export
-    and live-serve builders start from this, so the figure-resolution logic lives in
-    one place.
-
-    Absorbing the display costs a real GL screen, so the screens are closed once the
-    figure is in hand: an invisible one is still a live context whose render loop
-    keeps running for the rest of the session, against the same GPU driver the next
-    solve shares. The figure is unaffected, being data rather than the window that
-    was showing it.
+    The scoped Julia display keeps native plotters from opening an extra browser
+    tab. Evaluate user code in Main so the cleanup try block cannot make its
+    definitions local, and later Julia calls can reuse them.
+    Plot attributes, including transparency, are left to the plotter.
     """
 
     return (
         "    import CairoMakie, WGLMakie, Bonito\n"
-        # Load native-plotter GLMakie methods, offscreen so no desktop window pops.
-        f"    {IMPORT_GLMAKIE_OFFSCREEN}\n"
-        # Keep an offscreen backend active for the user code so an internal display()
-        # cannot open a browser tab (GLMakie offscreen if it loaded, else CairoMakie).
-        "    try; GLMakie.activate!(visible = false); catch; CairoMakie.activate!(); end\n"
+        f"    {IMPORT_GLMAKIE}\n"
         "    local _M = WGLMakie.Makie\n"
-        "    local _val = begin\n"
-        f"{user_code}\n"
+        "    local _jap_display = JutulAgent.JutulAgentPlots.start_web_capture()\n"
+        "    local _fig = try\n"
+        "        local _val = Core.eval(Main, Meta.parseall("
+        + json.dumps(user_code, ensure_ascii=False).replace("$", "\\$")
+        + "))\n"
+        "        JutulAgent.JutulAgentPlots.web_figure(_jap_display, _val)\n"
+        "    finally\n"
+        "        JutulAgent.JutulAgentPlots.stop_web_capture(_jap_display)\n"
         "    end\n"
-        "    local _fig = if _val isa _M.Figure\n"
-        "        _val\n"
-        "    elseif _val isa _M.FigureAxisPlot\n"
-        "        _val.figure\n"
-        "    elseif _val isa Tuple && length(_val) >= 1 && _val[1] isa _M.Figure\n"
-        "        _val[1]\n"
-        "    else\n"
-        "        _M.current_figure()\n"
-        "    end\n"
-        "    _fig === nothing && error(\n"
-        '        "plot_julia: the code did not produce a Makie figure. Return a Figure, "  *\n'
-        '        "or call a plotter that builds one."\n'
-        "    )\n"
-        # Release the GL screen the display absorption opened; the web surface never
-        # shows it, and its render loop would outlive the plot.
-        "    try; GLMakie.closeall(); catch; end\n" + RESTORE_OPAQUE_OVERLAY_DEPTH_WRITES
     )
-
-
-# GLMakie reads ``transparency = true`` as "composite me after all opaque geometry", and
-# has an order-independent pass that does it. WGLMakie has none: the attribute reaches
-# three.js as nothing but ``depthWrite: false`` (``create_material`` in ThreeHelper.js),
-# so the plot writes colour and no depth, and whatever renders after it paints over.
-# Upstream calls this a bug, MakieOrg/Makie.jl#4673, open and untouched since 2024-12, so
-# so this compensates for it rather than anticipating a fix.
-# ``transparent`` is set unconditionally there, so clearing the attribute costs no alpha
-# blending; it only gives the plot its depth writes back.
-#
-# Something does render after it: ``plot_explorer`` draws its gradient backdrop last and
-# leans on already-written depth to stay behind the 3D content. JutulDarcy's
-# ``plot_well!`` draws its well-name ``text!`` with ``transparency = true``, so the
-# backdrop erased every label except where the mesh sat behind one and held the depth test
-# off it; readable over the reservoir, gone over open background, fine in the terminal.
-#
-# Keyed on opacity, not on the plot being text: a plot with nothing to blend gains nothing
-# from ``transparency`` under either backend, and loses the depth that keeps it on screen
-# under this one. Anything not provably opaque keeps the attribute, and only the
-# annotation primitives are considered; surfaces, images and volumes are where
-# transparency does real work, so this doesn't get a vote there.
-RESTORE_OPAQUE_OVERLAY_DEPTH_WRITES = (
-    "    try\n"
-    "        local _jap_scenes = Any[_fig.scene]\n"
-    "        while !isempty(_jap_scenes)\n"
-    "            local _jap_s = pop!(_jap_scenes)\n"
-    "            local _jap_plots = Any[_jap_s.plots...]\n"
-    # Recipes nest, so walk each plot's own children rather than the scene's top level.
-    "            while !isempty(_jap_plots)\n"
-    "                local _jap_p = pop!(_jap_plots)\n"
-    "                if _jap_p isa _M.Text || _jap_p isa _M.Lines ||\n"
-    "                        _jap_p isa _M.LineSegments || _jap_p isa _M.Scatter\n"
-    "                    local _jap_opaque = false\n"
-    # Fail closed: an attribute set we cannot read leaves the plot exactly as the
-    # plotter asked for it.
-    "                    try\n"
-    "                        local _jap_c = _jap_p.color[]\n"
-    # One colour, many colours, or per-element values whose alpha lives in the
-    # colormap rather than in the values themselves.
-    "                        local _jap_cols = _jap_c isa AbstractArray{<:Real} ?\n"
-    "                            _M.to_colormap(_jap_p.colormap[]) :\n"
-    "                            _jap_c isa AbstractArray ? _jap_c : (_jap_c,)\n"
-    "                        _jap_opaque = _jap_p.alpha[] >= 1 &&\n"
-    "                            all(x -> _M.RGBAf(_M.to_color(x)).alpha >= 1, _jap_cols)\n"
-    "                    catch\n"
-    "                        _jap_opaque = false\n"
-    "                    end\n"
-    # Best-effort per plot: one plot whose attribute will not take must not cost the
-    # rest of the figure its overlays.
-    "                    if _jap_opaque\n"
-    "                        try; _jap_p.transparency[] = false; catch; end\n"
-    "                    end\n"
-    "                end\n"
-    "                append!(_jap_plots, _jap_p.plots)\n"
-    "            end\n"
-    "            append!(_jap_scenes, _jap_s.children)\n"
-    "        end\n"
-    "    catch\n"
-    "    end\n"
-)
 
 
 # Detach the screen ``CairoMakie.save`` registers on the figure while it renders the
@@ -499,21 +415,16 @@ def _poster_block(png_path: Path, *, html_fallback: Path | None) -> str:
     render the scene. WGLMakie is restored as the active backend either way, so later
     client connections to a live route render with it.
 
-    The poster is CairoMakie's, deliberately never GLMakie's: the first backend
-    to draw a plot registers backend-shaped computations on the figure, and a
-    second backend meeting them fails (MakieOrg/Makie.jl#5228; fix unreleased
-    as of Makie 0.24.13). A GL poster is that first backend, and the failure
-    lands in the live view — WGLMakie's render dies inside Bonito's websocket
-    handler, silently, and the browser spins forever; surface plots are the
-    known trigger. Cairo registers the same computations WGLMakie uses, so the
-    live render survives its poster, at the price of a slower save with no
-    depth test.
+    Cairo renders the poster without creating a desktop GL context. Its 3D
+    rendering can differ from the live WebGL view; the interactive figure remains
+    the authoritative view.
     """
 
     export = (
         "        WGLMakie.activate!(resize_to = :parent)\n"
         f'        Bonito.export_static(raw"{html_fallback.as_posix()}", Bonito.App(() ->\n'
-        f'            Bonito.DOM.div(_fig; style = "{_WRAP_STYLE}")))\n'
+        "            Bonito.DOM.div(WGLMakie.WithConfig(_fig; resize_to = :parent);\n"
+        f'                style = "{_WRAP_STYLE}")))\n'
         if html_fallback is not None
         else ""
     )
@@ -549,7 +460,9 @@ def web_render_call(
         + _fig_size_block(size, fit)
         + "    WGLMakie.activate!(resize_to = :parent)\n"
         + f'    Bonito.export_static(raw"{html_path.as_posix()}",\n'
-        f'        Bonito.App(() -> Bonito.DOM.div(_fig; style = "{_WRAP_STYLE}")))\n'
+        "        Bonito.App(() -> Bonito.DOM.div(\n"
+        "            WGLMakie.WithConfig(_fig; resize_to = :parent);\n"
+        f'            style = "{_WRAP_STYLE}")))\n'
         + _poster_block(png_path, html_fallback=None)
         + '    "ok"\n'
         "end"
@@ -567,7 +480,7 @@ def web_render_call(
 _WRAP_STYLE = "position:fixed; inset:0; margin:0; padding:0; overflow:hidden;"
 
 
-def web_server_start(port: int, session_id: str) -> str:
+def web_server_start(port: int, session_id: str, *, base_path: str = "") -> str:
     """Julia to start the session's Bonito server once (idempotent), returning the
     actual port it is bound to.
 
@@ -584,12 +497,14 @@ def web_server_start(port: int, session_id: str) -> str:
     to connect" embed.
 
     ``proxy_url`` tells Bonito to write every URL it hands the browser (asset
-    links and the widget websocket) as ``/live/<session_id>/...`` instead of an
-    absolute ``127.0.0.1:<port>``, so they resolve through the app server's own
-    ``/live/...`` reverse proxy (see ``interfaces/server/app.py``) rather than a
-    raw port the browser may have no route to (an SSH/VS Code/Docker port
-    forward that only knows about the app's own port). This is the same
+    links and the widget websocket) as ``{base_path}/live/<session_id>/...``
+    instead of an absolute ``127.0.0.1:<port>``, so they resolve through the app
+    server's own ``/live/...`` reverse proxy (see ``interfaces/server/app.py``)
+    rather than a raw port the browser may have no route to (an SSH/VS Code/Docker
+    port forward that only knows about the app's own port). This is the same
     site-relative-prefix mechanism Bonito already uses for JupyterHub/Binder.
+    ``base_path`` is the public prefix (e.g. ``/restricted``) when an SSO wrapper
+    reverse-proxies the UI; empty means the server is at ``/``.
     """
 
     # ``global`` (not ``Main.X = ``) so the assignment defines the Main global even
@@ -600,12 +515,14 @@ def web_server_start(port: int, session_id: str) -> str:
     # Python releasing it and Julia binding), Bonito's `start` silently retries on
     # port+1, port+2, ... and updates `.port` to whatever it actually bound;
     # echoing the request instead would advertise a dead port nothing listens on.
+    prefix = (base_path or "").rstrip("/")
+    proxy = f"{prefix}/live/{session_id}/"
     return (
         "begin\n"
         "    import WGLMakie, Bonito\n"
         "    if !isdefined(Main, :__JUTUL_WEB_SERVER__)\n"
         f'        global __JUTUL_WEB_SERVER__ = Bonito.Server("127.0.0.1", {int(port)};\n'
-        f'            proxy_url = raw"/live/{session_id}/")\n'
+        f'            proxy_url = raw"{proxy}")\n'
         "        global __JUTUL_WEB_FIGS__ = Dict{String,Any}()\n"
         # Routes in least-to-most recently served order. A recapture with no slot
         # has to name a figure, and the dict above is unordered, so recency is
@@ -639,11 +556,12 @@ def web_live_call(
     scenes. The figure is stored in the session's live-figure registry (keeping
     its Observables alive) and routed on the session's Bonito server, so the
     browser gets a *live* view whose in-figure widgets run their Julia callbacks.
-    A PNG is saved best-effort as the poster/record/``view``; if no rasteriser can
-    render the scene, a self-contained WebGL HTML is exported instead, so the
-    figure still has a durable record that resumes to a viewable plot rather than
-    a dead PNG. WGLMakie is restored afterwards so client connections render with
-    it.
+    A reload or a second tab takes the figure over from the previous view
+    (``JutulAgentWebViews``). A PNG is saved best-effort as the
+    poster/record/``view``; if no rasteriser can render the scene, a
+    self-contained WebGL HTML is exported instead, so the figure still has a
+    durable record that resumes to a viewable plot rather than a dead PNG.
+    WGLMakie is restored afterwards so client connections render with it.
 
     ``poster=False`` skips the durable record entirely, for a popout replay:
     that serves a second, ephemeral figure of a plot whose record already
@@ -655,6 +573,10 @@ def web_live_call(
         + _web_figure_block(user_code)
         + _fig_size_block(size, fit)
         + "    WGLMakie.activate!(resize_to = :parent)\n"
+        # Lay the figure out once; each browser view then keeps the user's zoom.
+        + "    WGLMakie.Makie.update_state_before_display!(_fig)\n"
+        # A same-slot re-plot replaces the route's figure; close the old one's page.
+        + f'    JutulAgent.JutulAgentWebViews.drop!(Main.__JUTUL_WEB_FIGS__, raw"{route}")\n'
         + f'    Main.__JUTUL_WEB_FIGS__[raw"{route}"] = _fig\n'
         # Move the route to the end of the recency list (a re-plot on the same slot
         # reuses its route, so drop any earlier entry rather than double-listing it).
@@ -667,16 +589,21 @@ def web_live_call(
         # downgrades views, so under normal use this never fires.
         f"        while length(_order) > {WEB_LIVE_ROUTE_CAP}\n"
         "            local _victim = popfirst!(_order)\n"
-        "            delete!(Main.__JUTUL_WEB_FIGS__, _victim)\n"
+        "            JutulAgent.JutulAgentWebViews.drop!(Main.__JUTUL_WEB_FIGS__, _victim)\n"
         "            try\n"
         "                Main.Bonito.delete_route!(Main.__JUTUL_WEB_SERVER__, _victim)\n"
         "            catch\n"
         "            end\n"
         "        end\n"
         "    end\n"
-        f'    Bonito.route!(Main.__JUTUL_WEB_SERVER__, raw"{route}" => Bonito.App(() ->\n'
-        f'        Bonito.DOM.div(Main.__JUTUL_WEB_FIGS__[raw"{route}"];\n'
+        f'    Bonito.route!(Main.__JUTUL_WEB_SERVER__, raw"{route}" => Bonito.App(_session ->\n'
+        # A reload or a second tab takes the figure over from the previous view. A
+        # later plot can change the global screen config before this route is opened
+        # or reloaded, so bind resizing to the view itself.
+        "        Bonito.DOM.div(JutulAgent.JutulAgentWebViews.view(_session,\n"
+        f'            Main.__JUTUL_WEB_FIGS__[raw"{route}"]; resize_to = :parent);\n'
         f'            style = "{_WRAP_STYLE}")))\n'
+        + _PRINT_LIVE_ROUTES
         + (_poster_block(png_path, html_fallback=html_path) if poster else "")
         + '    "ok"\n'
         "end"
@@ -853,9 +780,10 @@ def close_web_plots_call(slot: str) -> str:
     """Julia to release live web figures: one slot's route, or all when empty.
 
     The web counterpart of ``close_windows_call``, which closes native windows and
-    so has nothing to close on this surface. Unrouting the figure and dropping it
-    from the registry is what lets the kernel reclaim what a live figure holds. A
-    tab already open in the browser keeps showing its last frame until reloaded.
+    so has nothing to close on this surface. Closing the figure's browser page,
+    unrouting the figure and dropping it from the registry is what lets the kernel
+    reclaim what a live figure holds. A tab already open in the browser keeps
+    showing its last frame.
     """
 
     routes = f'[raw"{viz_route(slot)}"]' if slot else "collect(keys(Main.__JUTUL_WEB_FIGS__))"
@@ -865,14 +793,14 @@ def close_web_plots_call(slot: str) -> str:
         # never plotted; a server that exists is also what proves Bonito is loaded.
         "    if isdefined(Main, :__JUTUL_WEB_SERVER__)\n"
         f"        for r in {routes}\n"
-        "            delete!(Main.__JUTUL_WEB_FIGS__, r)\n"
+        "            Main.JutulAgent.JutulAgentWebViews.drop!(Main.__JUTUL_WEB_FIGS__, r)\n"
         "            filter!(!=(r), Main.__JUTUL_WEB_ORDER__)\n"
         "            try\n"
         "                Main.Bonito.delete_route!(Main.__JUTUL_WEB_SERVER__, r)\n"
         "            catch\n"
         "            end\n"
         "        end\n"
-        "    end\n"
+        "        " + _PRINT_LIVE_ROUTES.lstrip() + "    end\n"
         '    "ok"\n'
         "end"
     )

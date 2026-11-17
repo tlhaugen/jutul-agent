@@ -22,6 +22,8 @@ To run locally:
         -e 'using Pkg; Pkg.instantiate()'
     uv run pytest tests/integration/test_julia_plot_integration.py
 
+Set JUTUL_AGENT_TEST_JULIA_PROJECT to reuse a prepared JutulDarcy environment.
+
 On headless Linux GLMakie needs a virtual display; the ``plot_display`` fixture
 starts a private Xvfb (as production does via ``managed_display``). CI runs these
 in the JutulDarcy job of the ``Simulators`` workflow.
@@ -29,6 +31,7 @@ in the JutulDarcy job of the ``Simulators`` workflow.
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 
@@ -43,7 +46,9 @@ from jutul_agent.simulators.env_setup import manifest_has_package
 from jutul_agent.simulators.jutuldarcy import JUTULDARCY
 from jutul_agent.workspace import sync_shared_julia_package
 
-JUTULDARCY_ENV = JUTULDARCY.julia_env_template_path
+JUTULDARCY_ENV = Path(
+    os.environ.get("JUTUL_AGENT_TEST_JULIA_PROJECT", JUTULDARCY.julia_env_template_path)
+)
 
 
 @pytest.fixture(autouse=True)
@@ -125,6 +130,108 @@ async def _plot(tool, code: str, slot: str):
 pytestmark = pytest.mark.integration
 
 
+@pytest.mark.skipif(
+    not _julia_available() or not _wgl_ready(JUTULDARCY_ENV),
+    reason="Julia and a WGLMakie-instantiated jutuldarcy env are required",
+)
+async def test_web_warmup_does_not_open_native_screens(plot_display) -> None:
+    from jutul_agent.simulators.warmup import start_warmup
+
+    async with JuliaKernel(_plot_kernel_config(plot_display)) as julia:
+        await start_warmup(julia, JUTULDARCY.warm_package, native_plotting=False)
+        result = await julia.eval(
+            "@assert WGLMakie.Makie.current_backend() === WGLMakie; "
+            "@assert isempty(JutulAgent.GLMakie.ALL_SCREENS); nothing"
+        )
+        assert not result.error, result.error
+
+
+@pytest.mark.skipif(
+    not _julia_available() or not _wgl_ready(JUTULDARCY_ENV),
+    reason="Julia and a WGLMakie-instantiated jutuldarcy env are required",
+)
+async def test_web_capture_preserves_backend_attributes_and_display_state(plot_display) -> None:
+    config = _plot_kernel_config(plot_display)
+    async with JuliaKernel(config) as julia:
+        loaded = await julia.eval("using JutulAgent")
+        assert not loaded.error, loaded.error
+        source = Path(__file__).with_name("web_capture.jl")
+        result = await julia.eval(f'include(raw"{source.as_posix()}")')
+        assert not result.error, result.error
+        # Exercise the generated cleanup block, including Julia's top-level scope
+        # and dollar interpolation, rather than only calling the helpers directly.
+        code = r"""
+web_capture_number = 123
+web_capture_function(x) = x + web_capture_number
+web_capture_literal = "\$ stays literal"
+web_capture_figure = WGLMakie.Figure()
+WGLMakie.lines!(WGLMakie.Axis(web_capture_figure[1, 1]), 1:3)
+display(web_capture_figure)
+nothing
+"""
+        rendered = await julia.eval("begin\n" + jl._web_figure_block(code) + "\nend")
+        assert not rendered.error, rendered.error
+        persisted = await julia.eval(
+            "@assert web_capture_function(1) == 124\n"
+            '@assert web_capture_literal == "\\$ stays literal"\n'
+            '"persistent definitions ok"'
+        )
+        assert not persisted.error, persisted.error
+        failed = await julia.eval(
+            "begin\n" + jl._web_figure_block('error("expected capture error")') + "\nend"
+        )
+        assert "expected capture error" in (failed.error or "")
+        restored = await julia.eval(
+            "@assert !any(d -> d isa JutulAgent.JutulAgentPlots.WebPlotDisplay, "
+            "Base.Multimedia.displays)"
+        )
+        assert not restored.error, restored.error
+
+
+@pytest.mark.skipif(
+    not _julia_available() or not _wgl_ready(JUTULDARCY_ENV),
+    reason="Julia and a WGLMakie-instantiated jutuldarcy env are required",
+)
+async def test_web_view_take_over(plot_display) -> None:
+    async with JuliaKernel(_plot_kernel_config(plot_display)) as julia:
+        loaded = await julia.eval("using JutulAgent")
+        assert not loaded.error, loaded.error
+        source = Path(__file__).with_name("web_views.jl")
+        checked = await julia.eval(f'include(raw"{source.as_posix()}")')
+        assert not checked.error, checked.error
+
+
+@pytest.mark.skipif(
+    not _julia_available() or not _wgl_ready(JUTULDARCY_ENV),
+    reason="Julia and a WGLMakie-instantiated jutuldarcy env are required",
+)
+async def test_dropped_routes_close_their_pages(plot_display, tmp_path, monkeypatch) -> None:
+    open_page = (
+        "global page = WGLMakie.Bonito.Session(); "
+        'JutulAgent.JutulAgentWebViews.view(page, Main.__JUTUL_WEB_FIGS__["/viz/{}"]); nothing'
+    )
+    page_closed = "@assert WGLMakie.Bonito.isclosed(page)"
+    code = "fig = WGLMakie.Figure(); WGLMakie.lines!(WGLMakie.Axis(fig[1, 1]), 1:3); fig"
+    async with JuliaKernel(_plot_kernel_config(plot_display)) as julia:
+        session = _session(julia, tmp_path, "web-drop")
+        tool = make_plot_julia_tool(session, surface="web")
+        assert "served a live interactive plot" in await _plot(tool, code, "a")
+        assert not (await julia.eval(open_page.format("a"))).error
+        # A re-plot of the same slot replaces its figure.
+        assert "served a live interactive plot" in await _plot(tool, code, "a")
+        assert not (await julia.eval(page_closed)).error
+        # Eviction past the cap, then closing the remaining plot.
+        monkeypatch.setattr(jl, "WEB_LIVE_ROUTE_CAP", 1)
+        assert not (await julia.eval(open_page.format("a"))).error
+        assert "served a live interactive plot" in await _plot(tool, code, "b")
+        assert not (await julia.eval(page_closed)).error
+        assert not (await julia.eval(open_page.format("b"))).error
+        assert not (await julia.eval(jl.close_web_plots_call("b"))).error
+        result = await julia.eval(page_closed + "; @assert isempty(Main.__JUTUL_WEB_FIGS__)")
+        assert not result.error, result.error
+        session.finalize()
+
+
 # Every Makie return shape that `_as_figure` must resolve, built from plain Makie so
 # the test stays stable across simulator-package changes. `nonfig` is the negative
 # case: a non-figure value must NOT capture the (now stale) current figure.
@@ -133,6 +240,15 @@ _FIGURE_SHAPES = {
     "returns_figureaxisplot": "lines(1:3)",
     "returns_tuple": "fig = Figure(); ax = Axis(fig[1, 1]); (fig, ax, lines!(ax, 1:3))",
     "draws_then_nothing": "fig = Figure(); lines!(Axis(fig[1, 1]), 1:3); display(fig); nothing",
+    # A plotter that returns its figure inside a wrapper, the shape JutulDarcy's
+    # plot_reservoir has (Jutul's PlotExplorerOutput), mimicked with a NamedTuple so
+    # the case needs no simulator package. It leaves an *empty* figure current, so
+    # resolving it by the current_figure fallback instead of by the `fig` field
+    # captures nothing and the tool errors -- the wrapper has to be unwrapped.
+    "returns_wrapper": (
+        "f = Figure(); lines!(Axis(f[1, 1]), 1:3); current_figure!(Figure()); "
+        "(fig = f, lscene = nothing)"
+    ),
 }
 
 
@@ -210,6 +326,9 @@ async def test_plot_julia_view_returns_image_blocks(tmp_path: Path, plot_display
 _NATIVE_PLOTTERS = {
     "reservoir_domain": "plot_reservoir(domain)",
     "reservoir_model": "plot_reservoir(model)",
+    "reservoir_state": "plot_reservoir(model, state)",
+    "reservoir_fixed": "plot_reservoir(model, state; gui=false)",
+    "reservoir_simple": "plot_reservoir(model, state; fancy=false)",
     "cell_data": "plot_cell_data(physical_representation(domain), domain[:porosity])",
     "variable_graph": (
         "using GraphMakie, NetworkLayout, LayeredLayouts\n"
@@ -220,11 +339,67 @@ _NATIVE_PLOTTERS = {
 
 
 @pytest.mark.skipif(
+    not _julia_available() or not _wgl_ready(JUTULDARCY_ENV),
+    reason="Julia and a WGLMakie-instantiated jutuldarcy env are required",
+)
+async def test_reservoir_phase_selection(tmp_path: Path, plot_display) -> None:
+    """Keep the selected phase and timestep controls in GUI and static views."""
+    views = [
+        'plot_reservoir(model, states; key="Saturations row 2", step=3)',
+        "plot_reservoir(model, states; gui=false, key=:Saturations, row=2, step=3)",
+    ]
+    async with JuliaKernel(_plot_kernel_config(plot_display)) as julia:
+        setup = await julia.eval(
+            "using Jutul, JutulDarcy\n"
+            "g = CartesianMesh((3, 3, 2), (30.0, 30.0, 6.0))\n"
+            "domain = reservoir_domain(g; permeability=1e-13, porosity=0.2)\n"
+            "sys = ImmiscibleSystem((AqueousPhase(), LiquidPhase()); "
+            "reference_densities=[1000.0, 800.0])\n"
+            "model = setup_reservoir_model(domain, sys)\n"
+            "states = [Dict(:Pressure => collect(range(1e7, 1.1e7; length=18)) .+ i*1e5, "
+            ":Saturations => repeat([0.1*i, 1-0.1*i], 1, 18)) for i in 1:3]\n"
+        )
+        assert not setup.error, setup.error
+        session = _session(julia, tmp_path, "phase-selection")
+        try:
+            tool = make_plot_julia_tool(session, surface="web")
+            for i, code in enumerate(views):
+                slot = f"phase-{i}"
+                result = await _plot(tool, code, slot)
+                assert "served a live interactive plot" in result, result
+                png = session.output_dir / "artifacts" / f"{slot}.png"
+                assert png.exists() and png.stat().st_size > 1000
+                if i == 1:
+                    check = "@assert !any(x -> x isa Makie.Menu || x isa Makie.Slider, fig.content)"
+                else:
+                    check = (
+                        "slider = only(filter(x -> x isa Makie.Slider, fig.content))\n"
+                        "@assert slider.range[] == 1:3\n"
+                        "@assert slider.value[] == 3\n"
+                        "Makie.set_close_to!(slider, 2)\n"
+                        "@assert any(x -> x isa Makie.Label && "
+                        'occursin("Dynamic data step: 2/3", string(x.text[])), fig.content)\n'
+                    )
+                    check += (
+                        "@assert any(x -> x isa Makie.Menu && "
+                        'x.selection[] == "Saturations row 2", fig.content)\n'
+                    )
+                verified = await julia.eval(
+                    f'let fig = Main.__JUTUL_WEB_FIGS__["/viz/{slot}"], Makie = WGLMakie.Makie\n'
+                    f"{check}\nend"
+                )
+                assert not verified.error, f"{slot}: {verified.error}"
+        finally:
+            session.finalize()
+
+
+@pytest.mark.skipif(
     not _julia_available() or not _gl_ready(JUTULDARCY_ENV),
     reason="Julia and a GLMakie-instantiated jutuldarcy env are required",
 )
-async def test_native_plotters_render_to_png(tmp_path: Path, plot_display) -> None:
-    """Every native plotter we document renders to a non-blank PNG through plot_julia."""
+@pytest.mark.parametrize("surface", ["native", "web"])
+async def test_native_plotters_render_to_png(tmp_path: Path, plot_display, surface: str) -> None:
+    """Native plotters work through both the GL capture and WGL + Cairo poster paths."""
     config = _plot_kernel_config(plot_display)
     async with JuliaKernel(config) as julia:
         session = _session(julia, tmp_path, "native-plotters")
@@ -239,23 +414,44 @@ async def test_native_plotters_render_to_png(tmp_path: Path, plot_display) -> No
             "sys = ImmiscibleSystem((LiquidPhase(), VaporPhase()); "
             "reference_densities = [1000.0, 100.0])\n"
             "model = setup_reservoir_model(domain, sys; wells = [Inj, Prod])\n"
+            "state0 = setup_reservoir_state(model; Pressure=1e7, Saturations=[1.0, 0.0])\n"
+            "state = state0[:Reservoir]\n"
             '"setup ok"'
         )
         assert not setup.error, f"model setup failed: {setup.error}"
 
         # Run every plotter, collecting failures so one broken plotter doesn't mask
         # which of the others render (the report then names exactly what failed).
-        tool = make_plot_julia_tool(session)
+        tool = make_plot_julia_tool(session, surface="web" if surface == "web" else "terminal")
+        expected = "served a live interactive plot" if surface == "web" else "saved plot to"
         failures: list[str] = []
         for slot, code in _NATIVE_PLOTTERS.items():
             result = await _plot(tool, code, slot)
             png = session.output_dir / "artifacts" / f"{slot}.png"
-            if "saved plot to" not in result:
+            if expected not in result:
                 failures.append(f"{slot}: tool error: {result}")
             elif not png.exists():
                 failures.append(f"{slot}: no PNG written")
             elif png.stat().st_size <= 1000:
                 failures.append(f"{slot}: PNG looks blank ({png.stat().st_size} bytes)")
+            elif surface == "web":
+                # A Cairo poster does not exercise browser serialization. Render each
+                # plotter into two pages; the second takes the figure over.
+                checked = await julia.eval(
+                    "let B = WGLMakie.Bonito, V = JutulAgent.JutulAgentWebViews\n"
+                    f'    fig = Main.__JUTUL_WEB_FIGS__["/viz/{slot}"]\n'
+                    "    pages = [B.Session(B.NoConnection(); asset_server = B.NoServer())\n"
+                    "             for _ in 1:2]\n"
+                    "    for page in pages\n"
+                    "        app = B.App(s -> B.DOM.div(V.view(s, fig; resize_to = :parent)))\n"
+                    "        show(IOBuffer(), B.session_dom(page, app))\n"
+                    "    end\n"
+                    "    @assert B.isclosed(pages[1])\n"
+                    "    foreach(close, pages)\n"
+                    "end"
+                )
+                if checked.error:
+                    failures.append(f"{slot}: web serialization: {checked.error}")
         session.finalize()
         assert not failures, "native plotters failed:\n" + "\n".join(failures)
 

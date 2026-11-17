@@ -15,7 +15,7 @@
   refused" no client-side retry can recover from, since the port genuinely
   isn't reachable from where the browser sits.
 
-``web_render_call`` and ``web_live_call`` share three more, each a way for a figure to
+``web_render_call`` and ``web_live_call`` share two more, each a way for a figure to
 reach the browser looking or behaving wrong rather than failing outright:
 
 - ``CairoMakie.save``, the poster's fallback rasteriser, registers a screen on the
@@ -25,9 +25,6 @@ reach the browser looking or behaving wrong rather than failing outright:
 - ``PICK_EMPTY_BUFFER_GUARD``: WGLMakie's ``pick`` throws on an empty buffer, and a
   plotter that picks on click turns that throw into a dead mouse button for every
   listener behind it.
-- ``RESTORE_OPAQUE_OVERLAY_DEPTH_WRITES``: ``transparency = true`` costs a plot its depth
-  writes under WGLMakie and buys it nothing else, so a plotter that paints its backdrop
-  last erases every opaque overlay drawn that way.
 """
 
 from __future__ import annotations
@@ -42,9 +39,9 @@ from jutul_agent.agent.plot_julia_src import (
     PICK_EMPTY_BUFFER_GUARD,
     PICK_GUARD_MARKER,
     PREFER_OPEN_SCREEN_GUARD,
-    RESTORE_OPAQUE_OVERLAY_DEPTH_WRITES,
     SCREEN_PREFERENCE_MARKER,
     WEB_LIVE_ROUTE_CAP,
+    close_web_plots_call,
     web_live_call,
     web_render_call,
     web_server_start,
@@ -62,6 +59,11 @@ def test_web_server_start_sets_a_site_relative_proxy_url() -> None:
     assert 'proxy_url = raw"/live/2026-01-01-0000-abcd/"' in code
 
 
+def test_web_server_start_includes_base_path_in_proxy_url() -> None:
+    code = web_server_start(12345, "2026-01-01-0000-abcd", base_path="/restricted")
+    assert 'proxy_url = raw"/restricted/live/2026-01-01-0000-abcd/"' in code
+
+
 def _live_code() -> str:
     return web_live_call(
         user_code="plot_reservoir(model, states[end])",
@@ -72,22 +74,18 @@ def _live_code() -> str:
 
 
 def test_live_call_never_lets_glmakie_draw_the_figure() -> None:
-    # The first backend to draw a figure claims it (MakieOrg/Makie.jl#5228): a
-    # GLMakie poster saves fine and the live WGLMakie render then dies inside
-    # the websocket handler, silently, so the browser spins forever. Surface
-    # plots are the trigger. The poster is Cairo's, whose computations WGLMakie
-    # shares.
+    # The web path needs no desktop GL rendering, including its poster.
     code = _live_code()
     assert "GLMakie.save" not in code
     assert "CairoMakie.save" in code
 
 
-def test_live_call_still_closes_the_absorption_screens() -> None:
-    # The user code runs under offscreen GLMakie so an internal display() cannot
-    # pop a window; the screens that absorption opens are still closed once the
-    # figure is in hand: an invisible screen is a live GL context whose render
-    # loop would otherwise run for the rest of the session.
-    assert "GLMakie.closeall" in _live_code()
+def test_web_construction_uses_scoped_capture_without_gl_rendering() -> None:
+    code = _live_code()
+    assert code.index("start_web_capture()") < code.index("plot_reservoir(")
+    assert "finally\n        JutulAgent.JutulAgentPlots.stop_web_capture" in code
+    assert not re.search(r"(?<!W)GLMakie\.activate!", code)
+    assert "GLMakie.closeall" not in code
 
 
 def test_live_call_detaches_the_screen_the_cairo_fallback_leaves_behind() -> None:
@@ -163,77 +161,22 @@ def test_screen_preference_returns_an_open_screen() -> None:
 def test_screen_preference_never_removes_a_screen() -> None:
     # Preference, not pruning. A screen mid-connect reports isopen == false, so
     # deleting on that basis takes the live view down with it; falling back to the
-    # first match keeps today's behaviour when nothing is open.
-    assert "first(matches)" in PREFER_OPEN_SCREEN_GUARD
+    # newest match keeps a connecting replacement available.
+    assert "Iterators.reverse(matches)" in PREFER_OPEN_SCREEN_GUARD
+    assert "last(matches)" in PREFER_OPEN_SCREEN_GUARD
     for destructive in ("filter!", "delete_screen!", "deleteat!", "empty!"):
         assert destructive not in PREFER_OPEN_SCREEN_GUARD
 
 
-def test_depth_writes_are_restored_on_both_web_paths() -> None:
-    # The erasure is a render-order problem, so it costs the live view and the static
-    # export alike -- both hand the same figure to WGLMakie.
+def test_web_paths_preserve_the_plotters_transparency_attributes() -> None:
     for code in (
         _live_code(),
         web_render_call(
             user_code="lines(1:10)", png_path=Path("/tmp/p.png"), html_path=Path("/tmp/p.html")
         ),
     ):
-        assert "transparency[] = false" in code
-
-
-def test_depth_writes_are_restored_before_the_figure_is_served() -> None:
-    # WGLMakie reads transparency when it serializes the plot, so a pass that ran after
-    # the route was registered would leave the first view -- the one the user sees --
-    # still missing its overlays.
-    code = _live_code()
-    assert code.index("transparency[] = false") < code.index("Bonito.route!")
-
-
-def test_translucency_is_what_decides_not_the_plot_being_text() -> None:
-    # The mismatch is about opacity: a plot with nothing to blend gains nothing from
-    # transparency under either backend, and loses its depth writes under this one. Text
-    # was only where we happened to see it first -- well trajectories and markers reach
-    # the same state.
-    for kind in ("_M.Text", "_M.Lines", "_M.LineSegments", "_M.Scatter"):
-        assert f"isa {kind}" in RESTORE_OPAQUE_OVERLAY_DEPTH_WRITES
-    assert "alpha[] >= 1" in RESTORE_OPAQUE_OVERLAY_DEPTH_WRITES
-    assert "_jap_opaque = false" in RESTORE_OPAQUE_OVERLAY_DEPTH_WRITES
-
-
-def test_surfaces_images_and_volumes_are_never_touched() -> None:
-    # Where transparency is load-bearing -- a volume's absorption rendering depends on
-    # it -- the pass does not get a vote at all.
-    for kind in ("_M.Mesh", "_M.Surface", "_M.Image", "_M.Heatmap", "_M.Volume", "_M.Voxels"):
-        assert kind not in RESTORE_OPAQUE_OVERLAY_DEPTH_WRITES
-
-
-def test_a_colour_that_cannot_be_read_keeps_its_transparency() -> None:
-    # Fail closed. Guessing wrong towards "opaque" hides whatever sits behind the plot,
-    # which is worse than the erasure this pass exists to undo.
-    assert (
-        "catch\n                        _jap_opaque = false" in RESTORE_OPAQUE_OVERLAY_DEPTH_WRITES
-    )
-
-
-def test_colour_mapped_overlays_are_judged_by_their_colormap() -> None:
-    # Per-element values carry no alpha of their own; a colormap with a translucent stop
-    # is what makes such a plot see-through.
-    assert "AbstractArray{<:Real}" in RESTORE_OPAQUE_OVERLAY_DEPTH_WRITES
-    assert "to_colormap" in RESTORE_OPAQUE_OVERLAY_DEPTH_WRITES
-
-
-def test_depth_pass_reaches_nested_plots_and_child_scenes() -> None:
-    # Overlays sit wherever the plotter put them: inside a recipe's own plot list, and in
-    # the child scene an LScene keeps its 3D content in.
-    assert "_jap_p.plots" in RESTORE_OPAQUE_OVERLAY_DEPTH_WRITES
-    assert "_jap_s.children" in RESTORE_OPAQUE_OVERLAY_DEPTH_WRITES
-
-
-def test_depth_pass_never_fails_the_plot() -> None:
-    # Best-effort, per plot and overall: a Makie whose attributes differ should cost the
-    # overlays their fix, not the user their figure.
-    assert RESTORE_OPAQUE_OVERLAY_DEPTH_WRITES.lstrip().startswith("try")
-    assert "try; _jap_p.transparency[] = false; catch; end" in RESTORE_OPAQUE_OVERLAY_DEPTH_WRITES
+        assert "transparency[]" not in code
+        assert "_jap_opaque" not in code
 
 
 def test_screen_preference_reports_whether_it_actually_applied() -> None:
@@ -266,6 +209,7 @@ def test_served_wrapper_is_fixed_to_the_viewport() -> None:
     for code in (live, static):
         assert "position:fixed" in code and "inset:0" in code
         assert "width:100%" not in code and "height:100%" not in code
+        assert "WGLMakie.WithConfig(" in code
 
 
 def test_live_call_echoes_the_figure_size_and_applies_a_requested_one() -> None:
@@ -399,6 +343,61 @@ def test_every_resize_survives_a_figure_whose_browser_session_died() -> None:
             # The nearest block opener before this resize is its own `try`.
             assert before.rstrip().endswith("try"), code[call.start() - 120 : call.end()]
         assert code.index("resize!") < code.index(FIG_SIZE_MARKER)
+
+
+def test_live_route_lets_each_new_view_take_the_figure_over() -> None:
+    # WGLMakie closes a figure's shared scene when any of its views closes, so a
+    # reload froze once the old page's session timed out. Each connection renders
+    # through the take-over view, and the figure is laid out once, before routing,
+    # so a reload keeps the user's zoom.
+    code = _live_code()
+    start = code.index("Bonito.route!")
+    route = code[start : code.index(")))", start)]
+    assert "JutulAgentWebViews.view(_session," in route
+    assert "resize_to = :parent" in route
+    assert "WithConfig" not in route
+    assert code.index("update_state_before_display!(_fig)") < start
+
+
+def test_live_routes_are_reported_after_they_change(tmp_path) -> None:
+    # The session keeps the reported list, so a replay offers live views only of
+    # figures the kernel still serves.
+    from jutul_agent.agent.plot_julia_src import LIVE_ROUTES_MARKER, web_live_call
+
+    serve = web_live_call(
+        user_code="fig = Figure()",
+        png_path=tmp_path / "a.png",
+        html_path=tmp_path / "a.html",
+        route="/viz/a",
+    )
+    assert serve.index(LIVE_ROUTES_MARKER) > serve.index("Bonito.route!")
+    assert LIVE_ROUTES_MARKER in close_web_plots_call("a")
+    assert LIVE_ROUTES_MARKER in close_web_plots_call("")
+
+
+def test_the_session_keeps_the_reported_routes() -> None:
+    from types import SimpleNamespace
+
+    from jutul_agent.agent.plot_julia import note_live_routes
+
+    session = SimpleNamespace(live_routes={"/viz/old"})
+    note_live_routes(session, "ok\n__JUTUL_LIVE_ROUTES__=/viz/a /viz/b--pop1\n")
+    assert session.live_routes == {"/viz/a", "/viz/b--pop1"}
+    note_live_routes(session, "__JUTUL_LIVE_ROUTES__=\n")  # everything closed
+    assert session.live_routes == set()
+    note_live_routes(session, "an error before the routes changed")
+    assert session.live_routes == set()  # nothing reported, nothing changed
+
+
+def test_dropping_a_live_route_closes_its_page() -> None:
+    # A re-plot of the same slot, eviction past the cap, and closing plots all
+    # close the dropped figure's browser page, so its view stops holding it.
+    code = _live_code()
+    replace = 'JutulAgentWebViews.drop!(Main.__JUTUL_WEB_FIGS__, raw"/viz/reservoir")'
+    assert code.index(replace) < code.index('Main.__JUTUL_WEB_FIGS__[raw"/viz/reservoir"] =')
+    assert "JutulAgentWebViews.drop!(Main.__JUTUL_WEB_FIGS__, _victim)" in code
+    for slot in ("reservoir", ""):
+        assert "JutulAgentWebViews.drop!(Main.__JUTUL_WEB_FIGS__, r)" in close_web_plots_call(slot)
 
 
 def test_live_call_caps_the_route_registry() -> None:

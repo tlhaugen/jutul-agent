@@ -23,7 +23,8 @@ WGLMakie = "276b4fcb-3e11-5398-bf8b-a0c2d153d008"
 
 # Minimum simulator release supported by the bundled skills.
 [compat]
-JutulDarcy = "0.3.11"
+Jutul = "0.5.4"
+JutulDarcy = "0.4"
 
 # Both deps are jutul-agent's in-env Julia runtime, declared as relative `[sources]`
 # paths so they survive the copy into a workspace. JutulAgent is the shared,

@@ -13,10 +13,11 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering",
 ]
 dependencies = [
-    "deepagents>=0.7.18",
+    "deepagents>=0.7.26",
     "python-dotenv>=1.0",
     # Provider packages we bundle so the selected models work out of the box
     # (langchain-anthropic arrives via deepagents). ollama covers local models;
@@ -30,7 +31,7 @@ dependencies = [
     "pygments>=2.17",
     "textual>=8.2.6",
     "pillow>=12.2.0",
-    # The web interface (`jutul-agent web`): HTTP + WebSocket API (uvicorn) and the
+    # The web interface (plain `jutul-agent`): HTTP + WebSocket API (uvicorn) and the
     # multipart parsing FastAPI needs for the web UI's file uploads.
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
@@ -122,7 +123,7 @@ cache-keys = [{ file = "pyproject.toml" }, { git = { commit = true, tags = true 
 # reproducible result for the loose ranges above (CI installs it with
 # `uv sync --locked`). To move forward: bump the date, run `uv lock`, run the
 # tests, and commit the updated lock.
-exclude-newer = "2026-09-23T18:00:00Z"
+exclude-newer = "2026-10-16T23:59:59Z"
 
 [tool.ruff]
 line-length = 100

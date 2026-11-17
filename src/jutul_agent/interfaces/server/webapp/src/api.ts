@@ -3,6 +3,7 @@
 
 import type { HostContext } from "./hostContext";
 import type { ReplayMessage } from "./protocol";
+import { withBase } from "./basePath";
 
 export interface ModelInfo {
   id: string;
@@ -42,6 +43,53 @@ export interface SimulatorsResponse {
   branding?: Branding | null;
 }
 
+/** What the server runs, from `GET /version`. Each part is `null` when unknown. */
+export interface VersionInfo {
+  jutul_agent: string | null;
+  /** A newer jutul-agent release, when the update check knows of one. */
+  update: string | null;
+  simulator: { package: string; version: string | null } | null;
+  /** This folder's Julia environment is older than this version supports. */
+  env_update?: boolean;
+  /** Identifies the server process; it changes when the server restarts. */
+  boot?: string | null;
+}
+
+/** A simulator package in the folder's Julia environment that needs updating. */
+export interface OutdatedPackage {
+  package: string;
+  version: string;
+  required: string;
+}
+
+/** An update started from the browser, as it runs. */
+export interface UpdateJob {
+  state: "running" | "restarting" | "done" | "failed";
+  install: boolean;
+  error: string | null;
+  /** Output lines after the `since` the request asked for. */
+  lines: string[];
+  /** Pass as `since` next time to get only newer lines. */
+  next: number;
+}
+
+/** What an update would do here, from `GET /update`. */
+export interface UpdateStatus {
+  current: string | null;
+  latest: string | null;
+  /** Served on this computer, so the browser may update it. */
+  local: boolean;
+  /** jutul-agent can upgrade itself from here; otherwise `install_note` says how. */
+  can_install: boolean;
+  install_note: string | null;
+  /** Upgrading jutul-agent continues in a separate window, which it then runs in. */
+  separate_window: boolean;
+  env: { outdated: OutdatedPackage[]; sysimage: boolean } | null;
+  job: UpdateJob | null;
+}
+
+export type SysimageChoice = "rebuild" | "off";
+
 export interface ModelsResponse {
   default: string | null;
   providers: string[];
@@ -70,9 +118,14 @@ export class ApiError extends Error {
   }
 }
 
+// Endpoints use unprefixed paths; apply the deployment prefix only at this boundary.
+function request(path: string, init?: RequestInit): Promise<Response> {
+  return fetch(withBase(path), init);
+}
+
 async function getJSON<T>(url: string, fallback: T): Promise<T> {
   try {
-    const resp = await fetch(url);
+    const resp = await request(url);
     if (!resp.ok) return fallback;
     return (await resp.json()) as T;
   } catch {
@@ -81,7 +134,7 @@ async function getJSON<T>(url: string, fallback: T): Promise<T> {
 }
 
 async function postJSON<T>(url: string, body: unknown): Promise<T> {
-  const resp = await fetch(url, {
+  const resp = await request(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -104,7 +157,27 @@ async function postJSON<T>(url: string, body: unknown): Promise<T> {
 
 export const api = {
   simulators: () =>
-    getJSON<SimulatorsResponse>("/simulators", { simulators: [], default: null, details: {} }),
+    getJSON<SimulatorsResponse>("/simulators", {
+      simulators: [],
+      default: null,
+      details: {},
+    }),
+
+  version: () =>
+    getJSON<VersionInfo>("/version", { jutul_agent: null, update: null, simulator: null }),
+
+  /** `null` when the server can't be reached, as while it restarts. */
+  updateStatus: async (since = 0): Promise<UpdateStatus | null> => {
+    try {
+      const resp = await request(`/update?since=${since}`);
+      return resp.ok ? ((await resp.json()) as UpdateStatus) : null;
+    } catch {
+      return null;
+    }
+  },
+
+  startUpdate: (body: { install: boolean; sysimage: SysimageChoice | null }) =>
+    postJSON<UpdateStatus>("/update", body),
 
   models: () =>
     getJSON<ModelsResponse>("/models", { default: null, providers: [], models: [] }),
@@ -112,10 +185,13 @@ export const api = {
   liveModels: () => getJSON<{ models: ModelInfo[] }>("/models/live", { models: [] }),
 
   credentials: async (): Promise<CredentialInfo[]> => {
-    const data = await getJSON<{ path: string; providers: CredentialInfo[] }>("/credentials", {
-      path: "",
-      providers: [],
-    });
+    const data = await getJSON<{ path: string; providers: CredentialInfo[] }>(
+      "/credentials",
+      {
+        path: "",
+        providers: [],
+      },
+    );
     return data.providers;
   },
 
@@ -163,10 +239,14 @@ export const api = {
   resumeSession: (
     id: string,
     body: { sim?: string; model?: string; host_context?: HostContext; host_api?: string },
-  ) => postJSON<{ session_id: string; kernel_restarted: boolean }>(`/sessions/${id}/resume`, body),
+  ) =>
+    postJSON<{ session_id: string; kernel_restarted: boolean }>(
+      `/sessions/${id}/resume`,
+      body,
+    ),
 
   deleteSession: (id: string) =>
-    fetch(`/sessions/${id}`, { method: "DELETE" }).catch(() => undefined),
+    request(`/sessions/${id}`, { method: "DELETE" }).catch(() => undefined),
 
   context: (id: string) =>
     getJSON<{ markdown: string }>(`/sessions/${id}/context`, { markdown: "" }),
@@ -174,13 +254,13 @@ export const api = {
   uploadFile: async (id: string, file: File): Promise<{ path: string }> => {
     const fd = new FormData();
     fd.append("file", file);
-    const resp = await fetch(`/sessions/${id}/upload`, { method: "POST", body: fd });
+    const resp = await request(`/sessions/${id}/upload`, { method: "POST", body: fd });
     if (!resp.ok) throw new Error(await resp.text().catch(() => resp.statusText));
     return (await resp.json()) as { path: string };
   },
 
   transcriptUrl: (id: string, fmt: "html" | "md") =>
-    `/sessions/${id}/transcript?format=${fmt}`,
+    withBase(`/sessions/${id}/transcript?format=${fmt}`),
 
-  memoryUrl: (id: string) => `/sessions/${id}/memory`,
+  memoryUrl: (id: string) => withBase(`/sessions/${id}/memory`),
 };

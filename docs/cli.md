@@ -11,24 +11,26 @@ flags are accepted by every command:
 
 ## Interfaces
 
-`jutul-agent` has three interfaces; pick one explicitly (bare `jutul-agent`
-prints this list and exits, rather than launching one by default):
+`jutul-agent` has three interfaces. With no command it starts the web UI:
 
 | Command | Interface |
 |---|---|
-| `jutul-agent web [options]` | Browser UI (HTTP + WebSocket server + bundled web app) |
+| `jutul-agent [options]` | Web UI (HTTP + WebSocket server + bundled web app); `jutul-agent web [options]` is the same |
 | `jutul-agent tui [options]` | Terminal UI |
 | `jutul-agent run "<prompt>" [options]` | One headless turn, then exit |
 
-`jutul-agent --version` prints the version.
+`jutul-agent --help` lists the commands, and `jutul-agent --version` prints the
+version. A word that is not a command is an error, so a typo or a bare prompt
+never starts a server.
 
-### jutul-agent web
+### jutul-agent (web UI)
 
 ```sh
-jutul-agent web [--sim <name>] [--approval-mode <mode>] [--model <m>] [--host <addr>] [--port <n>]
+jutul-agent [--sim <name>] [--approval-mode <mode>] [--model <m>] [--host <addr>] [--port <n>]
 ```
 
-Serves the browser UI (default <http://127.0.0.1:8742>). One folder is bound to
+Serves the web UI (default <http://127.0.0.1:8742>). `jutul-agent web` is the
+same command with the same options. One folder is bound to
 one simulator — from `--sim`, the workspace config, or auto-detection — and the
 choice is remembered. Runs locally for a single trusted user; the protocol and
 embedding are covered in [the server interface](server-interface.md).
@@ -49,6 +51,7 @@ changed per session in the UI.
 | `--sysimage` / `--no-sysimage` | Start sessions from the folder's [system image](sysimage.md), or skip it, overriding the folder's setting |
 | `--host <addr>` | Address to bind (default `127.0.0.1`, localhost only) |
 | `--port <n>` | Port to bind (default `8742`) |
+| `--allowed-origin <origin>` | Let pages from another origin use the server (repeatable). Only its own pages may by default; see [which pages may use it](server-interface.md#which-pages-may-use-it) |
 
 ### jutul-agent tui
 
@@ -90,9 +93,9 @@ included, so the first session in any interface is fast.
 | Option | Meaning |
 |---|---|
 | `--sim <name>` | Simulator to bootstrap (omit to auto-detect) |
-| `--source-path <path>` | `Pkg.develop` a local checkout of the simulator package (persisted to the workspace config) |
+| `--source-path <path>` | `Pkg.develop` a local checkout of the simulator package (persisted to the workspace config); the checkout's own `[compat]` replaces the template's bounds for the simulator and what it depends on |
 | `--no-precompile` | Skip the bake — bootstrap config + env only; the first session builds the rest |
-| `--force` | Replace an existing workspace env with a fresh template copy (after upgrading jutul-agent) |
+| `--force` | Replace an existing workspace env with a fresh template copy, discarding packages added to it (to update it in place instead, use `jutul-agent upgrade`) |
 | `--sysimage` | Also build a [system image](sysimage.md) for this folder, and start from it from now on. Adds tens of minutes to `init` |
 
 ## jutul-agent sysimage
@@ -147,24 +150,42 @@ overrides, since those take precedence over the saved one.
 
 ## jutul-agent upgrade
 
-Upgrade jutul-agent to the latest version, doing the right thing for how it
-was installed: a tool install runs `uv tool upgrade jutul-agent`; a dev
-checkout is pointed at `git pull && uv sync`. After upgrading, rebuild any
-workspace env that was set up with an older version
-(`jutul-agent init --sim <name> --force`).
+Bring everything up to date, in two steps:
+
+1. **jutul-agent itself.** If a newer release exists, upgrade it the right way
+   for how it was installed: a tool install runs `uv tool upgrade jutul-agent`;
+   a dev checkout is pointed at `git pull && uv sync`.
+2. **This folder's Julia environment.** A workspace env keeps the simulator
+   versions it resolved, so after an upgrade it can be older than the bundled
+   skills expect. If it is, update it in place to what the (new) version
+   supports, keeping packages added to it, and rebuild the folder's system
+   image if it uses one (from a terminal, you choose between rebuilding it and
+   no longer using one).
 
 ```sh
-jutul-agent upgrade           # upgrade to the latest
-jutul-agent upgrade --check   # report latest vs installed, change nothing
+jutul-agent upgrade             # both steps
+jutul-agent upgrade --check     # report both, change nothing
+jutul-agent upgrade --env-only  # only this folder's Julia environment
 ```
 
 | Option | Meaning |
 |---|---|
-| `--check` | Only report the latest available version; don't upgrade |
+| `--check` | Report the installed and latest versions and this folder's environment; change nothing |
+| `--env-only` | Only update this folder's Julia environment |
+| `--sysimage rebuild\|off` | If the folder uses a system image: rebuild it after the update, or stop using one (asked when run from a terminal) |
 
-jutul-agent also checks for updates at launch and prints a one-line notice
-when a newer version exists (cached for a day; runs in the background so it
-never delays startup). Disable it with `JUTUL_AGENT_NO_UPDATE_CHECK=1`.
+Use `jutul-agent init --force` instead to rebuild a workspace's environment
+from scratch. A launch in a workspace whose simulator is older than the
+installed version supports refuses to start, names both versions, and from a
+terminal offers to run the update.
+
+jutul-agent also checks for updates when the web UI and the terminal UI start,
+and prints a one-line notice when a newer version exists (cached for a day;
+runs in the background so it never delays startup). The web UI shows the
+jutul-agent and simulator versions at the foot of the sidebar, with a quiet
+"available" note when a newer release exists; clicking it runs the same update
+from the browser (see [Upgrading](usage.md#upgrading)). Disable the check with
+`JUTUL_AGENT_NO_UPDATE_CHECK=1`.
 
 ## jutul-agent transcript
 

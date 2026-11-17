@@ -135,10 +135,10 @@ describe("canvas interaction", () => {
   });
 
   it("a resumed session's poster clears the loader without looping", () => {
-    // Resuming demotes a live figure to its PNG poster, and a poster the browser
-    // has already decoded reports its load from the panel's mount check. Since
-    // that report re-renders the canvas, the whole path has to settle rather than
-    // feed itself another report.
+    // A session resumed from disk has no plot server, so its figure replays as
+    // its PNG poster, and a poster the browser has already decoded reports its
+    // load from the panel's mount check. Since that report re-renders the canvas,
+    // the whole path has to settle rather than feed itself another report.
     const complete = vi.spyOn(HTMLImageElement.prototype, "complete", "get").mockReturnValue(true);
     const { store, container } = renderWithStore(<Canvas />);
     act(() => store.getState().setSession("s1", ""));
@@ -146,11 +146,11 @@ describe("canvas interaction", () => {
       store.getState().replay([
         {
           type: "viz",
-          url: "/sessions/s1/viz/abc",
+          url: "/sessions/s1/artifacts/fig.png",
           kind: "plot",
           slot: "fig",
           title: "My figure",
-          live: true,
+          live: false,
           poster: "/sessions/s1/artifacts/fig.png",
         },
       ]),
@@ -275,5 +275,39 @@ describe("switching sessions", () => {
 
     expect(history).toHaveBeenCalled();
     vi.restoreAllMocks();
+  });
+});
+
+describe("version line", () => {
+  it("names jutul-agent and the simulator quietly, and an available update", () => {
+    const { store, container } = renderWithStore(<Sidebar collapsed={false} />);
+    expect(container.querySelector(".sidebar-foot")).toBeNull();
+    act(() =>
+      store.setState({
+        versions: {
+          jutul_agent: "0.2.1",
+          update: null,
+          simulator: { package: "JutulDarcy", version: "0.4.0" },
+        },
+      }),
+    );
+    expect(container.querySelector(".sidebar-versions")?.textContent).toBe(
+      "jutul-agent 0.2.1 · JutulDarcy 0.4.0",
+    );
+    expect(container.querySelector(".sidebar-update")).toBeNull();
+    act(() => store.setState({ versions: { jutul_agent: "0.2.1", update: "0.2.2", simulator: null } }));
+    const update = container.querySelector(".sidebar-update");
+    expect(update?.textContent).toBe("jutul-agent 0.2.2 available");
+    expect(update?.tagName).toBe("BUTTON"); // opens the update dialog
+  });
+
+  it("offers the environment update when only that is due", () => {
+    const { store, container } = renderWithStore(<Sidebar collapsed={false} />);
+    act(() =>
+      store.setState({
+        versions: { jutul_agent: "0.2.1", update: null, simulator: null, env_update: true },
+      }),
+    );
+    expect(container.querySelector(".sidebar-update")?.textContent).toBe("Update environment");
   });
 });

@@ -5,7 +5,15 @@
 
 import { createStore } from "zustand/vanilla";
 
-import type { Branding, CredentialInfo, HistoryEntry, ModelInfo, SimDetails } from "./api";
+import type {
+  Branding,
+  CredentialInfo,
+  HistoryEntry,
+  ModelInfo,
+  SimDetails,
+  UpdateStatus,
+  VersionInfo,
+} from "./api";
 import { framePool } from "./canvas/framePool";
 import { formatTokens } from "./format";
 import type { InterruptAction, ReplayMessage, ServerMessage } from "./protocol";
@@ -92,6 +100,15 @@ export interface CredentialPrompt {
   env_var: string;
 }
 
+/** The update dialog: what an update would do, then its output as it runs. */
+export interface UpdateDialog {
+  open: boolean;
+  status: UpdateStatus | null;
+  phase: "idle" | "starting" | "running" | "restarting" | "done" | "failed";
+  lines: string[];
+  error: string | null;
+}
+
 /** State of the API-keys modal: open in "manage" mode (required null) or because a
  *  specific provider's key is needed before the session/model switch can proceed. */
 export interface ApiKeysModal {
@@ -106,6 +123,8 @@ export interface SessionState {
   simDetails: Record<string, SimDetails>;
   // Set when an installed capability names the UI instead of the simulator.
   branding: Branding | null;
+  // What the server runs, for the version line in the sidebar.
+  versions: VersionInfo | null;
   model: string | null;
   models: ModelInfo[];
   contextWindow: number | null;
@@ -139,6 +158,7 @@ export interface SessionState {
   // provider API keys (status + the key-prompt modal)
   credentials: CredentialInfo[];
   apiKeys: ApiKeysModal;
+  update: UpdateDialog;
 }
 
 export interface SessionActions {
@@ -154,6 +174,7 @@ export interface SessionActions {
   setCredentials: (credentials: CredentialInfo[]) => void;
   openApiKeys: (required: CredentialPrompt | null) => void;
   closeApiKeys: () => void;
+  setUpdate: (patch: Partial<UpdateDialog>) => void;
   reset: () => void;
   // composer-driven
   addUser: (text: string) => void;
@@ -183,6 +204,7 @@ const initialState: SessionState = {
   sim: null,
   simDetails: {},
   branding: null,
+  versions: null,
   model: null,
   models: [],
   contextWindow: null,
@@ -207,6 +229,7 @@ const initialState: SessionState = {
   bottomPin: 0,
   credentials: [],
   apiKeys: { open: false, required: null },
+  update: { open: false, status: null, phase: "idle", lines: [], error: null },
 };
 
 function viewIdOf(msg: { slot?: string | null; url: string }): string {
@@ -356,25 +379,16 @@ export function createSessionStore() {
       const id = viewIdOf(msg);
       const kind: ViewKind = msg.kind === "report" ? "report" : "plot";
       const title = msg.title || (kind === "report" ? "Report" : "Interactive plot");
-      let live = !!msg.live;
-      let url = msg.url;
-      let expired = false;
+      const live = !!msg.live;
       let nonce = 0;
       if (replayed) {
-        // A replayed live view may only stay live when its original frame still
-        // exists in the pool (an in-page session switch): a fresh frame on a
-        // once-viewed figure comes up corrupt. Adopting aligns the nonce with
-        // the mounted frame; a pool miss (a reload, a cold resume) falls back
-        // to the poster and the regenerate button.
+        // The server marks a replayed view live only while it still serves the
+        // figure. When this page still holds the view's frame (an in-page session
+        // switch), adopt it so the figure stays exactly as it was. Otherwise (after
+        // a reload) a fresh frame opens a new view, which takes the figure over.
         const sid = get().sessionId ?? "";
         const pooled = live ? framePool.nonceOf(sid, id, msg.url) : null;
-        if (live && pooled !== null) {
-          nonce = pooled;
-        } else if (live) {
-          live = false;
-          if (msg.poster) url = msg.poster;
-          else expired = true;
-        }
+        if (pooled !== null) nonce = pooled;
         // A non-live replay whose view still has a pooled frame: that frame
         // belongs to a figure the server no longer serves (the kernel
         // restarted); release it rather than adopt it later.
@@ -383,7 +397,7 @@ export function createSessionStore() {
       upsertView(
         {
           id,
-          url,
+          url: msg.url,
           title,
           kind,
           poster: msg.poster ?? null,
@@ -391,7 +405,7 @@ export function createSessionStore() {
           live,
           // A refresh replaces the view wholesale: a re-plot or a regenerate
           // revives an expired view with a fresh figure.
-          expired,
+          expired: false,
           record: msg.record ?? null,
           width: msg.width ?? null,
           height: msg.height ?? null,
@@ -567,6 +581,7 @@ export function createSessionStore() {
       setCredentials: (credentials) => set({ credentials }),
       openApiKeys: (required) => set({ apiKeys: { open: true, required } }),
       closeApiKeys: () => set({ apiKeys: { open: false, required: null } }),
+      setUpdate: (patch) => set((s) => ({ update: { ...s.update, ...patch } })),
 
       reset: () =>
         set((s) => ({
@@ -575,12 +590,15 @@ export function createSessionStore() {
           sim: s.sim,
           simDetails: s.simDetails,
           branding: s.branding,
+          versions: s.versions,
           model: s.model,
           models: s.models,
           contextWindow: s.contextWindow,
           history: s.history,
           // key status is account-wide, not per-session; keep it across a reset
           credentials: s.credentials,
+          // an update outlives the session it was started from
+          update: s.update,
           // a reconnect resets the thread mid-recovery; keep the bar until the socket
           // reopens (the new socket's onopen clears it)
           reconnecting: s.reconnecting,

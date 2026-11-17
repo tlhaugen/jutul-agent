@@ -13,11 +13,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import re
-from collections.abc import AsyncIterator, Sequence
+import sys
+from collections.abc import AsyncIterator, Collection, Sequence
 from contextlib import asynccontextmanager
+from html import escape
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from urllib.parse import quote, urlparse
 
 from fastapi import (
@@ -50,9 +53,12 @@ from jutul_agent.agent.capabilities import (
     http_tool_capability,
 )
 from jutul_agent.interfaces.server import protocol
+from jutul_agent.interfaces.server.access import OriginGuard, request_is_local
 from jutul_agent.interfaces.server.manager import SessionBusyError, SessionManager
+from jutul_agent.interfaces.server.updates import BOOT_ID, Updater, UpdateRefused
 from jutul_agent.preview import TOOL_STREAM_RENDER_INTERVAL, TOOL_STREAM_TAIL_CAP
 from jutul_agent.session_host import SessionHost
+from jutul_agent.simulators.env_setup import EnvOutdatedError, EnvSetupError
 from jutul_agent.sysimage import SysimageUnavailable
 from jutul_agent.trace import schema
 
@@ -60,6 +66,26 @@ from jutul_agent.trace import schema
 # ``webapp/`` (the React app), committed and shipped so an install needs no Node.
 _SERVER_DIR = Path(__file__).resolve().parent
 WEB_DIST_DIR = _SERVER_DIR / "web_dist"
+
+
+def normalize_base_path(raw: str | None) -> str:
+    """Return ``""`` or a leading-slash prefix with no trailing slash (e.g. ``/restricted``)."""
+    if not raw:
+        return ""
+    p = raw.strip()
+    if not p or p == "/":
+        return ""
+    if not p.startswith("/"):
+        p = "/" + p
+    return p.rstrip("/")
+
+
+def public_url(base_path: str, path: str) -> str:
+    """Prefix a site-relative path with ``base_path``; leave absolute URLs alone."""
+    if not path.startswith("/"):
+        return path
+    prefix = normalize_base_path(base_path)
+    return f"{prefix}{path}" if prefix else path
 
 
 def _ui_dir() -> Path | None:
@@ -281,6 +307,13 @@ class CredentialRequest(BaseModel):
     value: str
 
 
+class UpdateRequest(BaseModel):
+    # Upgrade jutul-agent itself first, or only update the Julia environment.
+    install: bool = False
+    # What to do with this folder's system image, if it has one.
+    sysimage: Literal["rebuild", "off"] | None = None
+
+
 def _host_api_url(value: str | None) -> str | None:
     """Validate the host application's API address, or raise a 400.
 
@@ -374,10 +407,15 @@ def create_app(
     add_dirs: Sequence[Path] = (),
     ephemeral_memory: bool = False,
     sysimage: bool | None = None,
+    base_path: str = "",
+    updater: Updater | None = None,
+    local_only: bool = False,
+    allowed_origins: Sequence[str] = (),
 ) -> FastAPI:
     # The launch-wide knobs (folder-fixed) ride in the default manager's host
     # factory; an injected manager (tests) brings its own. The model is a default
     # a request can still override, so it is applied at the create/resume endpoint.
+    base = normalize_base_path(base_path)
     if manager is None:
         from jutul_agent.interfaces.server.manager import (
             SessionLaunchDefaults,
@@ -392,6 +430,7 @@ def create_app(
                     add_dirs=tuple(add_dirs),
                     ephemeral_memory=ephemeral_memory,
                     sysimage=sysimage,
+                    base_path=base,
                 )
             )
         )
@@ -407,6 +446,16 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.manager = manager
+    app.state.base_path = base
+    if updater is None:
+        from jutul_agent.paths import workspace_root
+
+        # Embedded or under test: report updates, but never run one.
+        updater = Updater(workspace_root(), local=False)
+    app.state.updater = updater
+    # Only this server's own pages may drive it; see interfaces/server/access.py.
+    # ``local_only`` (a server for this computer only) also checks Host.
+    app.add_middleware(OriginGuard, local_only=local_only, allowed_origins=allowed_origins)
 
     @app.get("/models")
     def list_models() -> dict[str, Any]:
@@ -497,6 +546,65 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"provider": info.name, "env_var": info.key_env_var, "path": str(path)}
 
+    @app.get("/version")
+    def version_info() -> dict[str, Any]:
+        """What this server runs, for the quiet version line in the UI.
+
+        The jutul-agent version, a newer release when the update check knows of
+        one, and the simulator version this folder's Julia environment resolved.
+        Each part is best-effort: an unknown one is ``None``, never an error.
+        """
+        from jutul_agent import __version__
+        from jutul_agent.paths import workspace_root
+        from jutul_agent.simulators import registry
+        from jutul_agent.update_check import is_enabled, pending_update, refresh_if_stale
+        from jutul_agent.workspace import resolve_julia_project, resolved_package_version
+
+        simulator = None
+        if default_sim is not None:
+            package = registry.get(default_sim).primary_package
+            project = julia_project or resolve_julia_project(workspace_root())
+            simulator = {
+                "package": package,
+                "version": resolved_package_version(project, package),
+            }
+        # A server can run for days, so it keeps its own view of releases current.
+        refresh_if_stale()
+        return {
+            "jutul_agent": __version__.split("+")[0],
+            "update": pending_update() if is_enabled() else None,
+            "simulator": simulator,
+            # The folder's Julia environment is older than this version supports.
+            "env_update": updater.env_update_needed(),
+            # Changes when the server restarts, e.g. after an update.
+            "boot": BOOT_ID,
+        }
+
+    @app.get("/update")
+    def update_status(since: int = 0) -> dict[str, Any]:
+        """What an update would do here, and the progress of one that is running.
+
+        ``since`` skips output lines the page already has.
+        """
+        return updater.status(since=since)
+
+    @app.post("/update", status_code=202)
+    async def start_update(req: UpdateRequest, request: Request) -> dict[str, Any]:
+        """Start updating jutul-agent and this folder's Julia environment.
+
+        Only this computer's own page may ask: the update runs commands and restarts
+        the server. See ``interfaces/server/updates.py``.
+        """
+        if not request_is_local(request.headers):
+            raise HTTPException(
+                status_code=403, detail="updates are only accepted from this computer"
+            )
+        try:
+            await updater.start(manager, install=req.install, sysimage=req.sysimage)
+        except UpdateRefused as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return updater.status()
+
     @app.get("/simulators")
     def list_simulators() -> dict[str, Any]:
         from jutul_agent.simulators import registry
@@ -534,7 +642,7 @@ def create_app(
                 status_code=409,
                 detail=(
                     f"this server is bound to simulator '{default_sim}'; run "
-                    "`jutul-agent web` from another folder to use a different simulator"
+                    "`jutul-agent` from another folder to use a different simulator"
                 ),
             )
         return default_sim
@@ -634,12 +742,11 @@ def create_app(
         views — so a reopened chat reconstructs inline exactly as it looked when
         the user left it, tool cards and all. Whether replayed plots keep their
         live URLs depends on the session: a still-running host with a live plot
-        server has its figures alive (an in-page switch back finds them), while a
-        from-disk resume restarted Julia, so its recorded live URLs are dead and
-        the embeds fall back to their saved posters. The client makes the final
-        call — it keeps a replayed view live only when it still holds the view's
-        original frame, because a fresh frame on a once-viewed figure comes up
-        corrupt.
+        server has the figures it still serves alive, while a from-disk resume
+        restarted Julia, so its recorded live URLs are dead and the embeds fall
+        back to their saved posters. A page that still holds a figure's frame (an
+        in-page switch back) keeps it; one that doesn't (after a reload) opens a
+        new view, which takes the figure over (see ``JutulAgentWebViews``).
         """
         host = manager.get(session_id)
         state_dir = host.session.state_dir if host else _session_state_dir(session_id)
@@ -650,10 +757,40 @@ def create_app(
         with TraceLog(state_dir / "trace.sqlite") as log:
             events = list(log.iter_events())
         live = host is not None and host.session.web_plot_port is not None
-        return {"messages": replay_events(events, session_id, live=live)}
+        bp = (
+            host.session.base_path
+            if host is not None
+            else (getattr(app.state, "base_path", "") or "")
+        )
+        routes = host.session.live_routes if live else None
+        messages = replay_events(events, session_id, live=live, live_routes=routes, base_path=bp)
+        return {"messages": messages}
+
+    def _refuse_while_updating() -> None:
+        if updater.running:
+            raise HTTPException(
+                status_code=409,
+                detail="jutul-agent is updating. Start a session when it has finished.",
+            )
+
+    def _env_conflict(exc: EnvSetupError | SysimageUnavailable) -> HTTPException:
+        """A 409 for an environment a session can't start in, saying how to fix it."""
+        if isinstance(exc, EnvOutdatedError) and updater.local:
+            found = ", ".join(f"{pkg} {ver}" for pkg, ver, _ in exc.outdated)
+            needed = ", ".join(f"{pkg} {spec}" for pkg, _, spec in exc.outdated)
+            return HTTPException(
+                status_code=409,
+                detail=(
+                    f"this folder's Julia environment has {found}, but this version of "
+                    f"jutul-agent requires {needed}. Update it with “Update environment” "
+                    "at the foot of the sidebar."
+                ),
+            )
+        return HTTPException(status_code=409, detail=str(exc))
 
     @app.post("/sessions")
     async def create_session(req: CreateSessionRequest) -> dict[str, str]:
+        _refuse_while_updating()
         sim = _bound_sim(req.sim)
         # Refuse before standing up the kernel if the model has no key: the UI
         # shows a key prompt on this structured error, then retries the create.
@@ -671,12 +808,12 @@ def create_app(
             )
         except KeyError as exc:  # unknown simulator
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except SysimageUnavailable as exc:
+        except (SysimageUnavailable, EnvSetupError) as exc:
             # The CLI checked the prepared environment before starting the server,
             # so reaching here normally means it moved while the server was up (a
-            # package was installed or edited). The message explains itself; pass
-            # it through as-is.
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            # package was installed or edited, or jutul-agent itself was upgraded).
+            # The message explains itself.
+            raise _env_conflict(exc) from exc
         # The agent already carries the selection (it was built with the layer
         # above); this records it on the session, so it is persisted for a later
         # resume, visible in the trace, and readable by capability tools. The API
@@ -693,6 +830,7 @@ def create_app(
     async def resume_session(session_id: str, req: ResumeSessionRequest) -> dict[str, Any]:
         if not _is_valid_session_id(session_id):
             raise HTTPException(status_code=404, detail="no such session")
+        _refuse_while_updating()
         # Validated before anything is reattached or rebuilt, so a bad address
         # cannot leave a session half-resumed.
         host_api = _host_api_url(req.host_api)
@@ -751,11 +889,12 @@ def create_app(
             )
         except (KeyError, FileNotFoundError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except SysimageUnavailable as exc:
+        except (SysimageUnavailable, EnvSetupError) as exc:
             # Match fresh-session creation: environment preparation can reveal
-            # that an image went stale while the server was running, and that is
-            # an actionable launch conflict rather than an internal server error.
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            # that an image or the environment went stale while the server was
+            # running, and that is an actionable launch conflict rather than an
+            # internal server error the page would wait on.
+            raise _env_conflict(exc) from exc
         # The resumed session read its own stored selection on the way up. Defer to
         # that when the request carried none: a front end running outside the host
         # application has nothing to say about the selection, and adopting its
@@ -817,8 +956,9 @@ def create_app(
             raise HTTPException(status_code=404, detail="no such plot route")
         if not (100 <= w <= 8192 and 100 <= h <= 8192):
             raise HTTPException(status_code=404, detail="implausible figure size")
-        src = f"/live/{quote(session_id)}/viz/{quote(route)}"
-        refit = f"/popout/{quote(session_id)}/refit?route={quote(route)}"
+        bp = getattr(app.state, "base_path", "") or ""
+        src = public_url(bp, f"/live/{quote(session_id)}/viz/{quote(route)}")
+        refit = public_url(bp, f"/popout/{quote(session_id)}/refit?route={quote(route)}")
         return HTMLResponse(
             _POPOUT_WRAPPER_HTML.replace("__SRC__", src)
             .replace("__REFIT__", refit)
@@ -1156,19 +1296,48 @@ def create_app(
     ui_dir = _ui_dir()
     if ui and ui_dir is not None:
         _register_web_mime_types()
-        app.mount("/", StaticFiles(directory=ui_dir, html=True), name="web")
+        index_html = (ui_dir / "index.html").read_text(encoding="utf-8")
+        # Vite emits relative assets. Use public paths so /restricted and
+        # /restricted/ both load, without relying on the proxy to redirect.
+        assets_url = escape(public_url(base, "/assets/"), quote=True)
+        index_html = re.sub(
+            r"""((?:src|href)=["'])\./assets/""",
+            lambda match: match[1] + assets_url,
+            index_html,
+        )
+        # Inject the public base path so the SPA prefixes API/WebSocket URLs.
+        inject = f"<script>window.__JUTUL_BASE_PATH__={json.dumps(base)};</script>"
+        if "<!--jutul-base-path-->" in index_html:
+            index_html = index_html.replace("<!--jutul-base-path-->", inject)
+        elif "</head>" in index_html:
+            index_html = index_html.replace("</head>", f"{inject}</head>", 1)
+        else:
+            index_html = inject + index_html
+
+        @app.api_route("/", methods=["GET", "HEAD"])
+        def serve_spa_index() -> HTMLResponse:
+            return HTMLResponse(index_html)
+
+        assets = ui_dir / "assets"
+        if assets.is_dir():
+            app.mount("/assets", StaticFiles(directory=assets), name="web-assets")
 
     return app
 
 
-def _artifact_url(session_id: str, rel: str) -> str:
+def _artifact_url(session_id: str, rel: str, *, base_path: str = "") -> str:
     """The fetch URL for a session artifact given its workspace-relative path."""
     rel = rel[len("artifacts/") :] if rel.startswith("artifacts/") else rel
-    return f"/sessions/{session_id}/artifacts/{rel}"
+    return public_url(base_path, f"/sessions/{session_id}/artifacts/{rel}")
 
 
 def artifact_wire_events(
-    payloads: list[dict[str, Any]], session_id: str, *, live: bool = True
+    payloads: list[dict[str, Any]],
+    session_id: str,
+    *,
+    live: bool = True,
+    live_routes: Collection[str] | None = None,
+    base_path: str = "",
 ) -> list[dict[str, Any]]:
     """Wire events for produced artifacts: interactive HTML as ``viz``, the rest as ``artifact``.
 
@@ -1180,13 +1349,23 @@ def artifact_wire_events(
     it any Bonito server that backed a live plot) has restarted, so a recorded
     ``live_url`` is dead. The figure then falls back to its saved PNG poster, shown
     inline as a static image, instead of an embed pointing at a gone server.
+
+    ``live_routes``, when given, are the routes the live server still serves: a
+    figure closed or released since it was recorded falls back to its poster too.
+
+    ``base_path`` prefixes site-relative URLs when the UI is served under a public
+    path (e.g. ``/restricted``); durable artifact records stay unprefixed.
     """
     events: list[dict[str, Any]] = []
+    live_prefix = f"/live/{session_id}"
     for payload in payloads:
-        url = _artifact_url(session_id, str(payload.get("path") or ""))
+        url = _artifact_url(session_id, str(payload.get("path") or ""), base_path=base_path)
         live_url = payload.get("live_url") if live else None
+        if live_url and live_routes is not None:
+            route = str(live_url).removeprefix(live_prefix)
+            live_url = live_url if route in live_routes else None
         poster = payload.get("poster")
-        poster_url = _artifact_url(session_id, str(poster)) if poster else None
+        poster_url = _artifact_url(session_id, str(poster), base_path=base_path) if poster else None
         kind = payload.get("kind")
         # A plot or report is a canvas view; a bare image or file is a plain artifact.
         if live_url or payload.get("mime") == "text/html" or kind in ("plot", "report"):
@@ -1195,7 +1374,7 @@ def artifact_wire_events(
             # gone, so a live plot falls back to its still-on-disk PNG poster instead
             # of a dead live URL — the figure stays viewable, just not interactive.
             if live_url:
-                view_url = str(live_url)
+                view_url = public_url(base_path, str(live_url))
             elif payload.get("mime") == "text/html":
                 view_url = url
             else:
@@ -1223,7 +1402,12 @@ def artifact_wire_events(
 
 
 def replay_events(
-    events: list[Any], session_id: str, *, live: bool = False
+    events: list[Any],
+    session_id: str,
+    *,
+    live: bool = False,
+    live_routes: Collection[str] | None = None,
+    base_path: str = "",
 ) -> list[dict[str, Any]]:
     """Wire messages that reconstruct a recorded conversation for a resumed session.
 
@@ -1234,7 +1418,8 @@ def replay_events(
     function (not inlined in the endpoint) so the replay mapping lives in a single,
     testable place. ``live`` says whether the session's live plot server is still
     running (its figures alive); without it a recorded live URL is dead and the
-    figure falls back to its poster.
+    figure falls back to its poster. ``live_routes`` narrows that to the figures
+    the server still serves.
     """
 
     items: list[dict[str, Any]] = []
@@ -1275,7 +1460,15 @@ def replay_events(
                 )
             )
         elif ev.kind == schema.ARTIFACT:
-            items.extend(artifact_wire_events([ev.payload], session_id, live=live))
+            items.extend(
+                artifact_wire_events(
+                    [ev.payload],
+                    session_id,
+                    live=live,
+                    live_routes=live_routes,
+                    base_path=base_path,
+                )
+            )
     return items
 
 
@@ -1479,7 +1672,9 @@ class _StreamState:
         if self._deferred_host_context is not None and not self._busy():
             await self._flush_host_context()
         if kind == "prompt":
-            await self._start_prompt(str(message.get("text") or ""))
+            text = str(message.get("text") or "")
+            _log_prompt(self._host.session_id, text)
+            await self._start_prompt(text)
         elif kind == "decision":
             await self._start_decision(message)
         elif kind == "cancel":
@@ -1793,9 +1988,10 @@ class _StreamState:
                 # instead of leaving the figure's layout behind the window's.
                 route_id = url.rsplit("/viz/", 1)[-1]
                 w, h = size_px or size or [1200, 800]
-                url = (
+                url = public_url(
+                    self._host.session.base_path,
                     f"/popout/{self._host.session.session_id}"
-                    f"?route={quote(route_id)}&w={int(w)}&h={int(h)}"
+                    f"?route={quote(route_id)}&w={int(w)}&h={int(h)}",
                 )
                 self._popouts[url] = route_id
             await self._end_turn(protocol.popout_ready_to_wire(record, url))
@@ -1868,13 +2064,14 @@ class _StreamState:
         if route_id is None or self._busy():
             return
         from jutul_agent.agent import plot_julia_src as jl
-        from jutul_agent.agent.plot_julia import REFIT_TIMEOUT_S
+        from jutul_agent.agent.plot_julia import REFIT_TIMEOUT_S, note_live_routes
 
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 self._host.session.julia.eval(jl.close_web_plots_call(route_id)),
                 REFIT_TIMEOUT_S,
             )
+            note_live_routes(self._host.session, result.output)
 
     def _busy(self) -> bool:
         return self._host.busy or (self._turn is not None and not self._turn.done())
@@ -2059,7 +2256,11 @@ class _StreamState:
         for event in self._host.session.trace.events_after(self._side_output_id):
             self._side_output_id = event.id
             if event.kind == schema.ARTIFACT:
-                for wire in artifact_wire_events([event.payload], self._host.session_id):
+                for wire in artifact_wire_events(
+                    [event.payload],
+                    self._host.session_id,
+                    base_path=self._host.session.base_path,
+                ):
                     await _safe_send(self._ws, wire)
             elif event.kind == schema.UI_COMMAND:
                 action = str(event.payload.get("action") or "")
@@ -2220,6 +2421,20 @@ class _StreamState:
             self._title_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._title_task
+
+
+# How much of a prompt the server log shows: enough to tell which log lines a
+# message belongs to, short enough to keep most of a prompt out of the log.
+PROMPT_LOG_CHARS = 80
+
+
+def _log_prompt(session_id: str, text: str) -> None:
+    """Log the start of a received prompt, in uvicorn's "INFO:" console format."""
+
+    preview = " ".join(text.split())
+    if len(preview) > PROMPT_LOG_CHARS:
+        preview = preview[:PROMPT_LOG_CHARS] + "…"
+    print(f"INFO:     received message [{session_id}]: {preview!r}", file=sys.stderr, flush=True)
 
 
 async def _safe_send(websocket: WebSocket, message: dict[str, Any]) -> None:

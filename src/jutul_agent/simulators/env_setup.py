@@ -21,9 +21,11 @@ import sys
 import tempfile
 import time
 import tomllib
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
+
+import tomli_w
 
 from jutul_agent.paths import workspace_root
 from jutul_agent.simulators.base import SimulatorAdapter
@@ -40,6 +42,8 @@ from jutul_agent.workspace import (
     mark_dependency_source,
     mark_env_precompiled,
     mark_warm_source,
+    newer_env_packages,
+    outdated_env_packages,
     recopy_warm_sources,
     resolve_julia_project,
     sync_julia_env_with_template,
@@ -54,6 +58,18 @@ from jutul_agent.workspace import (
 
 class EnvSetupError(RuntimeError):
     pass
+
+
+class EnvOutdatedError(EnvSetupError):
+    """The env resolved simulator packages older than this install supports.
+
+    ``outdated`` lists ``(package, resolved version, required compat)``, so a front
+    end can offer the update instead of only quoting the commands.
+    """
+
+    def __init__(self, message: str, outdated: list[tuple[str, str, str]]) -> None:
+        super().__init__(message)
+        self.outdated = outdated
 
 
 def _info(msg: str) -> None:
@@ -216,7 +232,7 @@ def bootstrap_workspace(
          workspace-local env, copy the template from the install.
          With ``force``, replace an existing workspace-local env first.
       2. If ``source_path`` is set, ``Pkg.develop(path=source_path)`` in
-         the workspace env (idempotent; safe to re-run).
+         the workspace env, overriding managed simulator compat (safe to re-run).
       3. If ``precompile``, ``Pkg.instantiate()`` then ``Pkg.precompile()``. The
          plotting stack is warmed by the env's ``JutulAgent`` package,
          whose ``@compile_workload`` bakes the Makie save path into the
@@ -257,8 +273,9 @@ def _bootstrap_workspace_unlocked(
     if precompile:
         cmds.extend(_RESILIENT_INSTANTIATE)
 
-    if len(cmds) > 1:
-        _run_pkg(project, cmds)
+    with _local_source_compat(adapter, workspace, project, source_path):
+        if len(cmds) > 1:
+            _run_pkg(project, cmds)
     if precompile:
         # Catch a broken/half-resolved manifest here (Julia fails to boot in the
         # env) instead of at launch. The kernel server is stdlib-only, so a
@@ -267,6 +284,64 @@ def _bootstrap_workspace_unlocked(
         mark_env_precompiled(project)  # so launch skips a redundant bake
 
     return project
+
+
+@contextmanager
+def _local_source_compat(
+    adapter: SimulatorAdapter, workspace: Path, project: Path, source_path: Path | None
+) -> Iterator[None]:
+    """Let a simulator checkout's own compat decide; roll back on failure.
+
+    The template bounds the simulator and the packages it shares with jutul-agent
+    (Jutul, say) to the released versions this install was made for. A checkout can
+    be ahead of those: an unreleased JutulDarcy that needs a newer Jutul. So drop
+    the template's bound on the simulator and on every package the checkout itself
+    declares compat for, and let the checkout's bounds govern.
+    """
+    if source_path is None or user_owns_root_project(workspace):
+        yield
+        return
+
+    project_file = project / "Project.toml"
+    before = project_file.read_bytes()
+    data = tomllib.loads(before.decode("utf-8"))
+    package = adapter.primary_package
+    compat = data.get("compat", {})
+    if not compat:
+        yield
+        return
+
+    # Only relax compat for a checkout of the intended simulator.
+    try:
+        source = tomllib.loads((source_path / "Project.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise EnvSetupError(f"Cannot read --source-path {source_path}/Project.toml: {exc}") from exc
+    if source.get("name") != package or source.get("uuid") != data.get("deps", {}).get(package):
+        raise EnvSetupError(
+            f"--source-path {source_path} must be a {package} checkout with its UUID"
+        )
+    source_compat = source.get("compat", {})
+    relaxed = [
+        name for name in compat if name == package or (name in source_compat and name != "julia")
+    ]
+    if not relaxed:
+        yield
+        return
+
+    backups = {project_file: before, **{p: p.read_bytes() for p in project.glob("Manifest*.toml")}}
+    dropped = {name: compat.pop(name) for name in relaxed}
+    project_file.write_text(tomli_w.dumps(data), encoding="utf-8")
+    bounds = ", ".join(f"{name} {spec!r}" for name, spec in dropped.items())
+    _info(f"Using local {package} checkout; its own compat replaces the managed {bounds}.")
+    try:
+        yield
+    except BaseException:
+        for path in project.glob("Manifest*.toml"):
+            if path not in backups:
+                path.unlink()
+        for path, contents in backups.items():
+            path.write_bytes(contents)
+        raise
 
 
 def precompile_env(project: Path) -> None:
@@ -351,7 +426,7 @@ def update_env(project: Path) -> None:
     reconciles stay cheap.
     """
 
-    _run_pkg(project, ["using Pkg", _REGISTRY_UPDATE, _UPDATE, _PRECOMPILE])
+    _run_pkg(project, ["using Pkg", _REGISTRY_UPDATE, _UPDATE, _PRECOMPILE], echo=False)
     mark_env_precompiled(project)
 
 
@@ -484,6 +559,7 @@ def _prepare_workspace_env_unlocked(
             _rebuild_managed_env(adapter, workspace, sim_name, reason=f"was built for {foreign}")
             return
 
+        check_env_versions(adapter, workspace, julia_project, sim_name)
         _sync_workspace_env(adapter, workspace, julia_project, sim_name)
         _refresh_warm_sources(adapter, workspace, julia_project, sim_name)
 
@@ -491,7 +567,92 @@ def _prepare_workspace_env_unlocked(
 
     _ensure_simulator_installed(adapter, workspace, julia_project, sim_name)
     _ensure_env_warmed(workspace, julia_project, sim_name, dependencies)
-    _reconcile_env_template(adapter, workspace, julia_project, sim_name)
+    _reconcile_env_template(adapter, workspace, julia_project)
+
+
+def check_env_versions(
+    adapter: SimulatorAdapter, workspace: Path, julia_project: Path, sim_name: str | None
+) -> None:
+    """Refuse a managed env whose simulator is older than this install supports.
+
+    The bundled skills are written for the template's simulator versions, so an env
+    resolved under an older jutul-agent would run with guidance its simulator does
+    not support. Its ``[compat]`` came from that older template, so nothing else
+    would ever move it forward. An env the user owns (a root ``Project.toml``, or
+    one passed with ``--julia-project``) is not checked.
+    """
+
+    if user_owns_root_project(workspace):
+        return
+    outdated = outdated_env_packages(julia_project, adapter.julia_env_template_path)
+    if not outdated:
+        return
+    found = ", ".join(f"{package} {version}" for package, version, _ in outdated)
+    needed = ", ".join(f"{package} {spec}" for package, _, spec in outdated)
+    sim = f" --sim {sim_name}" if sim_name else ""
+    raise EnvOutdatedError(
+        f"this workspace's Julia environment has {found}, but this version of "
+        f"jutul-agent requires {needed}. Update it, keeping packages added to it:\n"
+        f"    jutul-agent upgrade\n"
+        f"or rebuild it from scratch:\n    jutul-agent init --force{sim}",
+        outdated,
+    )
+
+
+def newer_simulator_note(
+    adapter: SimulatorAdapter, workspace: Path, julia_project: Path
+) -> str | None:
+    """A note when the env runs simulator packages newer than this install was made for.
+
+    Not a refusal: a simulator developer trying an unreleased or just-released
+    version lands here, and so does a folder a newer jutul-agent set up.
+    """
+
+    if user_owns_root_project(workspace):
+        return None
+    newer = newer_env_packages(julia_project, adapter.julia_env_template_path)
+    if not newer:
+        return None
+    found = ", ".join(f"{package} {version}" for package, version, _ in newer)
+    made_for = ", ".join(f"{package} {spec}" for package, _, spec in newer)
+    return (
+        f"this folder's Julia environment has {found}, newer than this version of "
+        f"jutul-agent was made for ({made_for}). It runs, but the bundled skills may "
+        "not cover what changed."
+    )
+
+
+def upgrade_env(
+    adapter: SimulatorAdapter, workspace: Path, julia_project: Path, sim_name: str | None
+) -> None:
+    """Move a managed env forward to the installed template, keeping added packages.
+
+    Brings in deps the template added, raises the ``[compat]`` of each package
+    outside the template's range to the template's, then updates and precompiles.
+    Other bounds stay, including the one a local simulator checkout removed. A
+    failed resolve restores the ``Project.toml`` and points at the clean rebuild.
+    """
+
+    with _workspace_env_lock(workspace):
+        project_toml = julia_project / "Project.toml"
+        before = project_toml.read_text(encoding="utf-8")
+        template = adapter.julia_env_template_path
+        try:
+            sync_julia_env_with_template(template, workspace=workspace)
+            data = tomllib.loads(project_toml.read_text(encoding="utf-8"))
+            outdated = outdated_env_packages(julia_project, template)
+            data.setdefault("compat", {}).update({pkg: spec for pkg, _, spec in outdated})
+            project_toml.write_text(tomli_w.dumps(data), encoding="utf-8")
+            _info(f"Upgrading the workspace's {adapter.display_name} environment...")
+            update_env(julia_project)
+        except (EnvSetupError, OSError, tomllib.TOMLDecodeError) as exc:
+            project_toml.write_text(before, encoding="utf-8")
+            rebuild = "jutul-agent init --force" + (f" --sim {sim_name}" if sim_name else "")
+            raise EnvSetupError(
+                f"could not upgrade the environment in place ({exc}). Rebuild it "
+                f"from scratch instead:\n    {rebuild}"
+            ) from exc
+        write_env_template_stamp(julia_project, template)
 
 
 def _foreign_simulator(julia_project: Path, adapter: SimulatorAdapter) -> str | None:
@@ -751,36 +912,22 @@ def _ensure_simulator_installed(
         _rebuild_managed_env(adapter, ws, sim_name, reason="could not be resolved")
 
 
-def _reconcile_env_template(
-    adapter: SimulatorAdapter, ws: Path, julia_project: Path, sim_name: str | None
-) -> None:
-    """Warn when the managed env was built from an older template than the install.
+def _reconcile_env_template(adapter: SimulatorAdapter, ws: Path, julia_project: Path) -> None:
+    """Record that the managed env now matches the installed template.
 
-    The other reconcile steps self-heal *added* deps; this catches the changes
-    they can't (a dep dropped, a compat tightened, a ``[sources]`` path moved)
-    after an upgrade, pointing at the one-command rebuild the docs prescribe.
-    Never touches a user-owned root env, and stays quiet for an env whose stamp
-    already matches — baselining a stamp-less (pre-feature) env instead of nagging.
+    By the time this runs, the env has passed the version check (an older simulator
+    is refused before here), gained any deps the template added, and had its bundled
+    packages refreshed. A changed template leaves nothing to fix, so refresh the
+    stamp rather than warn. Never touches a user-owned root env.
     """
 
     if user_owns_root_project(ws) or not env_declares_warm_packages(julia_project):
         return
-
     template = adapter.julia_env_template_path
-    if not env_template_drifted(julia_project, template):
+    if env_template_drifted(julia_project, template):
+        write_env_template_stamp(julia_project, template)
+    else:
         ensure_env_template_stamp(julia_project, template)
-        return
-
-    rebuild = "jutul-agent init --force"
-    if sim_name:
-        rebuild += f" --sim {sim_name}"
-    print(
-        "warning: this workspace's Julia env was built from an older "
-        f"{adapter.display_name} template than the installed jutul-agent. It will "
-        "still run, but to pick up the new template rebuild it with:\n"
-        f"             {rebuild}",
-        file=sys.stderr,
-    )
 
 
 def _ensure_env_warmed(

@@ -32,12 +32,13 @@ flowchart LR
 
 ## The web UI
 
-`jutul-agent web` starts the server with a built-in web app: a chat interface
-that is a visual alternative to the terminal UI. The web stack ships in the core
-install, so nothing extra is needed. Point it at a simulator and open the browser:
+`jutul-agent`, run with no command, starts the server with a built-in web app:
+the chat interface jutul-agent is normally used through (`jutul-agent web` is the
+same command). The web stack ships in the core install, so nothing extra is
+needed. Point it at a simulator and open the browser:
 
 ```
-jutul-agent web --sim jutuldarcy
+jutul-agent --sim jutuldarcy
 ```
 
 Open <http://127.0.0.1:8742>. Type a task and watch the agent stream its reply,
@@ -52,7 +53,7 @@ command line is: the folder is its launch directory (or `--workspace`), and the
 simulator comes from `--sim`, the folder's saved `[workspace] simulator`, or
 auto-detection, and is then remembered for next time. Every session in that
 folder shares one simulator and one Julia environment; the UI does not switch
-simulators in place. To work with a different simulator, run `jutul-agent web`
+simulators in place. To work with a different simulator, run `jutul-agent`
 from a different folder. (A future central launcher that opens sessions across folders is a
 deliberate later step; the create/resume API already accepts a folder and a
 simulator per request, so it can grow into that without a protocol change.)
@@ -111,6 +112,9 @@ turn.
 | `GET` | `/credentials` | Which providers have keys, and whether a shell variable shadows a saved one |
 | `POST` | `/credentials` | Save a provider API key (used by the missing-key prompt) |
 | `GET` | `/simulators` | List installed simulators (the server is bound to one, returned as `default`), each with its display name and starter prompts, plus the `branding` an installed capability puts in their place |
+| `GET` | `/version` | The jutul-agent version, a newer release if the update check knows of one, the simulator version the folder's Julia environment resolved (each `null` when unknown), whether that environment needs updating (`env_update`), and a `boot` id that changes when the server restarts |
+| `GET` | `/update` | What an update would do here (newer release, whether this install can upgrade itself and how to otherwise, whether it does so in a separate window, outdated simulator packages), and the output of a running update (`?since=` skips lines already read). A server restarted by an update reports that update's output and outcome as its `job` |
+| `POST` | `/update` | Start an update: `{"install": bool, "sysimage": "rebuild" \| "off" \| null}`. Accepted only from this computer's own page; refused (409) while a session is starting or working. With `install`, the server restarts into the new version when done. On Windows it exits instead, and a helper in a new console window runs the update and starts the server again there |
 
 ## The wire protocol
 
@@ -362,15 +366,14 @@ instead of opening a desktop window.
 This covers both figures the agent builds with Makie and a simulator's own native
 interactive plotters. The native 3D viewers (for example JutulDarcy's
 `plot_reservoir`, with its mesh, well trajectories, and field/timestep widgets)
-build standard Makie scenes; their plotting methods ship in a GLMakie extension,
-so the web session loads GLMakie for those methods while WGLMakie does the actual
-browser rendering. Loading GLMakie needs a GL context, which the server provides
-with an Xvfb on a headless box and which is already present on a workstation with
-a display. A native plotter is asked to return its figure rather than open a
-desktop window (`new_window = false`). Camera control (rotate, zoom, pan) runs in
-the browser, and the in-figure widgets (a timestep slider, a field selector) drive
-Julia callbacks over the live server's WebSocket; on the static fallback the camera
-still works but those widgets are inert.
+build standard Makie scenes. The tool constructs web figures with WGLMakie
+active. Ordinary `display` calls are captured without opening desktop windows.
+GLMakie remains loaded for native capture and other simulator extensions; its
+context uses Xvfb on a headless box or the workstation's display. Web startup
+selects WGLMakie without creating a native GL window. Camera control (rotate,
+zoom, pan) runs in the browser, and the in-figure widgets (a timestep slider,
+a field selector) drive Julia callbacks over the live server's WebSocket; on the
+static fallback the camera still works but those widgets are inert.
 
 The image form is kept as well. It is the record written to the session's history
 and report, the fallback when an interactive view is not available, and what
@@ -391,6 +394,30 @@ the service can require authentication, and a session can be run in its own
 isolated process. Until that isolation is in place the service should not be
 exposed to untrusted users, because the agent has real access to the machine it
 runs on.
+
+### Which pages may use it
+
+A browser lets any website send requests to `127.0.0.1` and open WebSockets to
+it, so the server turns away pages that aren't its own. A WebSocket, or a request
+that changes something, is only answered when the browser's `Origin` is the
+server's own: the host the request was sent to, or the `X-Forwarded-Host` a
+reverse proxy passed on. A server bound to localhost also answers only to
+localhost names, so a site can't point its own domain at `127.0.0.1` and pass as
+the server's page. Programs that aren't browsers send no `Origin` and are not
+affected.
+
+A front end served from another origin (your own web app, say) must be allowed
+by name:
+
+```sh
+jutul-agent --allowed-origin https://app.example.org
+```
+
+Behind a reverse proxy (`--base-path`), the `Host` check is off, since the
+proxy's public name arrives there, but `Origin` is still checked. A proxy that
+rewrites `Host` should pass the original on in `X-Forwarded-Host`; otherwise
+allow its public origin with `--allowed-origin`. The server log names any origin
+it refuses, with the flag to allow it.
 
 ## The example app
 

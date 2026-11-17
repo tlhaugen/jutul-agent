@@ -1,4 +1,4 @@
-"""``jutul-agent web`` subcommand: run the HTTP + WebSocket server.
+"""``jutul-agent`` (or ``jutul-agent web``): run the HTTP + WebSocket server.
 
 Front ends talk to this server to drive sessions; the wire contract is in
 docs/server-interface.md. The web stack (FastAPI + uvicorn) ships in the core
@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import os
 import sys
 from typing import TYPE_CHECKING
 
+from jutul_agent import __version__
 from jutul_agent.interfaces.cli._helpers import add_session_flags, add_workspace_flags
 
 if TYPE_CHECKING:
@@ -20,10 +22,23 @@ if TYPE_CHECKING:
     from jutul_agent.workspace import WorkspaceConfig
 
 
+def _origin(value: str) -> str:
+    from jutul_agent.interfaces.server.access import normalize_origin
+
+    try:
+        return normalize_origin(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def build_parser(prog: str = "jutul-agent web") -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=prog,
-        description="Run the jutul-agent web interface (HTTP + WebSocket server + browser UI).",
+        description=(
+            "Run the jutul-agent web UI (HTTP + WebSocket server + browser app). "
+            "`jutul-agent` and `jutul-agent web` are the same command and take the same "
+            "options."
+        ),
     )
     from jutul_agent.simulators import registry
 
@@ -33,6 +48,27 @@ def build_parser(prog: str = "jutul-agent web") -> argparse.ArgumentParser:
         help="Address to bind (default 127.0.0.1, localhost only).",
     )
     parser.add_argument("--port", type=int, default=8742, help="Port to bind (default 8742).")
+    parser.add_argument(
+        "--allowed-origin",
+        action="append",
+        default=[],
+        type=_origin,
+        metavar="ORIGIN",
+        help=(
+            "Let pages from this origin (e.g. https://app.example.org) use the server too. "
+            "Only its own pages may by default. Repeat for more."
+        ),
+    )
+    parser.add_argument(
+        "--base-path",
+        default="",
+        help=(
+            "Public URL prefix the browser sees this server under (e.g. /restricted when "
+            "an SSO wrapper reverse-proxies the UI). Empty means the server is at /. "
+            "API routes still bind at /; generated browser URLs and Bonito proxy_url "
+            "include the prefix."
+        ),
+    )
     parser.add_argument(
         "--sim",
         default=None,
@@ -104,6 +140,18 @@ def _resolve_simulator(args: argparse.Namespace) -> str | None:
     return sim
 
 
+def _env_versions_ok(args: argparse.Namespace, ws: Path, *, sim: str) -> bool:
+    """Refuse a workspace env older than this install supports, before binding.
+
+    Without a usable system image the env is prepared per session, so the same
+    check inside that preparation would only fail once the browser is open.
+    """
+    from jutul_agent.interfaces.cli._helpers import env_versions_ok
+    from jutul_agent.simulators import registry
+
+    return env_versions_ok(registry.get(sim), ws, args.julia_project, sim)
+
+
 def _sysimage_ready(
     args: argparse.Namespace, ws: Path, config: WorkspaceConfig, *, sim: str
 ) -> bool:
@@ -149,7 +197,7 @@ def _sysimage_ready(
 
     if decision.blocks:
         print(
-            f"\n{sysimage_mod.refusal(decision, command='jutul-agent web')}",
+            f"\n{sysimage_mod.refusal(decision, command='jutul-agent')}",
             file=sys.stderr,
         )
         return False
@@ -195,11 +243,29 @@ def run(args: argparse.Namespace) -> int:
     model = args.model or config.model
     add_dirs = resolve_add_dirs(args.add_dir, ws)
 
-    if not _sysimage_ready(args, ws, config, sim=sim):
-        return 1
+    from jutul_agent.interfaces.server.access import is_loopback_host
+    from jutul_agent.interfaces.server.updates import RESTARTED_ENV_VAR, Updater, restart_server
+
+    restarted = os.environ.pop(RESTARTED_ENV_VAR, None) is not None
+    if restarted:
+        # Restarted by an update from the browser, which is waiting for this server:
+        # start, and let the page report anything the update left to fix.
+        print("Restarted after updating.", file=sys.stderr)
+        if not _sysimage_ready(args, ws, config, sim=sim):
+            print("Starting without the system image.", file=sys.stderr)
+            args.sysimage = False
+    else:
+        from jutul_agent.update_check import notify_at_launch
+
+        notify_at_launch()
+        if not _env_versions_ok(args, ws, sim=sim) or not _sysimage_ready(
+            args, ws, config, sim=sim
+        ):
+            return 1
 
     print(
-        f"jutul-agent server on http://{args.host}:{args.port} (simulator: {sim}"
+        f"jutul-agent {__version__.split('+')[0]} server on http://{args.host}:{args.port} "
+        f"(simulator: {sim}"
         + (f", model: {model}" if model else "")
         + (f", approval: {approval_mode}" if approval_mode else "")
         + (f", +{len(add_dirs)} dir(s)" if add_dirs else "")
@@ -207,18 +273,44 @@ def run(args: argparse.Namespace) -> int:
         + ")",
         file=sys.stderr,
     )
-    uvicorn.run(
-        create_app(
-            default_sim=sim,
-            default_approval_mode=approval_mode,
-            default_model=model,
-            julia_project=args.julia_project,
-            threads=args.threads,
-            add_dirs=add_dirs,
-            ephemeral_memory=args.ephemeral_memory,
-            sysimage=args.sysimage,
-        ),
-        host=args.host,
-        port=args.port,
+    # Serving this computer only: no reverse proxy in front (that would set
+    # --base-path), and bound to a loopback address.
+    local = is_loopback_host(args.host) and not args.base_path
+    updater = Updater(ws, local=local)
+    if restarted:
+        updater.report_last_update()
+    app = create_app(
+        default_sim=sim,
+        default_approval_mode=approval_mode,
+        default_model=model,
+        julia_project=args.julia_project,
+        threads=args.threads,
+        add_dirs=add_dirs,
+        ephemeral_memory=args.ephemeral_memory,
+        sysimage=args.sysimage,
+        base_path=args.base_path,
+        updater=updater,
+        local_only=local,
+        allowed_origins=args.allowed_origin,
     )
+    server = uvicorn.Server(
+        uvicorn.Config(app, host=args.host, port=args.port, timeout_graceful_shutdown=5)
+    )
+    updater.bind_server(lambda: setattr(server, "should_exit", True))
+    try:
+        server.run()
+    except KeyboardInterrupt:
+        # Ctrl+C: uvicorn re-raises it once it has shut down. Stop here, as
+        # uvicorn.run does, without a traceback or a restart; the clean exit also
+        # lets the window an update opened for this server close.
+        return 0
+    if not server.started:  # the port was taken, say; uvicorn said why
+        return 1
+    if updater.restart_requested:
+        restart_server()
+    if updater.handed_off:
+        print(
+            "jutul-agent is updating in a separate window, and runs there after.",
+            file=sys.stderr,
+        )
     return 0

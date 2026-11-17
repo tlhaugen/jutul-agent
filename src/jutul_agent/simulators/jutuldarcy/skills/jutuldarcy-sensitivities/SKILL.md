@@ -154,14 +154,29 @@ the input parameter. In particular, a permeability gradient may hold the well
 indices fixed, so that the sensitivity in perforated cells is incomplete, while
 a perturbed simulation that rebuilds the case changes them.
 
-Inspect the returned sensitivity structure for entries belonging to the well
-models, such as well-index sensitivities. If they are present and the well
-index depends on the parameter, the full sensitivity in a perforated cell is
+In JutulDarcy, `JutulDarcy.reservoir_sensitivities(case, result, objective;
+include_parameters = true)` returns the permeability gradient under the key
+`:permeability`, with the well indices held fixed. The sensitivities with
+respect to the well indices are available from the lower-level adjoint
+solve, which returns one entry per model, keyed by the well names:
+
+    sens  = Jutul.solve_adjoint_sensitivities(case, result.result, objective)
+    dJ_dWI = sens[:WellName][:WellIndices]      # one value per perforation
+    WI     = case.parameters[:WellName][:WellIndices]
+
+Here `result` is the output of `simulate_reservoir`, and `:WellName` is the
+name given to the well, for example `:Injector` or `:Producer`. Inspect
+`keys(sens)` to see the available entries.
+
+The full log-permeability sensitivity in a perforated cell `c` is
 
     dJ/dlogK_c = (dJ/dlogK_c with well indices fixed) + (dWI_c/dlogK_c) * dJ/dWI_c
 
 For an isotropic Peaceman well index, `WI_c` is proportional to `K_c`, so
-`dWI_c/dlogK_c = WI_c`.
+`dWI_c/dlogK_c = WI_c`, and the correction is `WI .* dJ_dWI` added to the
+entries of the perforated cells. Map each perforation to its reservoir cell
+from the well definition, and check that the number of well indices equals
+the number of perforated cells before adding the correction.
 
 Either apply this correction or report clearly that the gradient holds well
 indices fixed. The directional check in section 7 detects the difference.

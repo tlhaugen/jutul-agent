@@ -23,9 +23,13 @@ Scoring rules, fixed before any runs:
   fixed.
 - The most sensitive cell is accepted if it is any cell in the reference's
   ``accepted_top_cells``, the cells that tie with the largest component within
-  the accuracy of the reference.
-- Tolerances default to ``10 * eps_ref``, where ``eps_ref`` is the accuracy of
-  the reference estimated from repeated and tightened runs.
+  ``eps``.
+- Tolerances default to ``tau = 10 * eps`` with ``eps = max(eps_ref, 1e-4)``,
+  where ``eps_ref`` is the accuracy of the reference estimated from repeated
+  and tightened runs. The floor allows for valid choices, such as linear
+  solver settings, whose effect exceeds the reference's own accuracy. The
+  reference script writes ``tau``; older references fall back to
+  ``10 * eps_ref``.
 - A run is reliable if the gradient is correct and the agent claims it is
   validated, or if the gradient is incorrect and the agent does not claim so.
 """
@@ -74,7 +78,11 @@ def load_reference(ref_dir: Path) -> dict[str, Any]:
 
 
 def _tolerance(reference: dict[str, Any], tol: float | None) -> float:
-    return tol if tol is not None else 10.0 * float(reference["eps_ref"])
+    if tol is not None:
+        return tol
+    if "tau" in reference:
+        return float(reference["tau"])
+    return 10.0 * float(reference["eps_ref"])
 
 
 def _workspace(state: TaskState) -> Path | None:

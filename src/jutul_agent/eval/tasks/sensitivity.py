@@ -45,6 +45,12 @@ from jutul_agent.eval.sensitivity_scorers import (
     top_cell_accepted,
 )
 from jutul_agent.eval.solver import jutul_agent_solver, load_eval_credentials
+from jutul_agent.eval.tasks._sensitivity_case import (
+    FLUIDS,
+    SIMULATION,
+    SIMULATION_KWARGS,
+    SIMULATION_STEPPING,
+)
 
 load_eval_credentials()
 
@@ -52,6 +58,9 @@ REFERENCE_ROOT = Path(__file__).parent / "_sensitivity_reference"
 BASE = REFERENCE_ROOT / "base"
 HELDOUT = REFERENCE_ROOT / "heldout"
 LOOSE = REFERENCE_ROOT / "loose"
+
+# The T6 region (x and y index at most this value), chosen in the reference script.
+_REGION_MAX = int(json.loads((BASE / "reference.json").read_text(encoding="utf-8"))["region_x_max"])
 
 _LIMITS = {"time_limit": 3600, "token_limit": 3_000_000, "message_limit": 160}
 
@@ -62,13 +71,12 @@ _BASE_CASE = (
     "- Grid: 20 x 20 x 1 cells over a 1000 x 1000 x 100 m domain.\n"
     "- Rock: uniform porosity 0.2 and uniform permeability 0.1 darcy.\n"
     "- Wells: a vertical injector at (1, 1) and a vertical producer at (20, 20).\n"
-    "- Fluids: immiscible aqueous and vapor phases with reference densities "
-    "1000 and 700 kg/m^3.\n"
-    "- Initial state: 150 bar and fully aqueous-saturated.\n"
+    + FLUIDS
+    + "- Initial state: 150 bar and fully aqueous-saturated.\n"
     "- Schedule: 24 steps of 30 days.\n"
     "- Injector: vapor injection on total-rate control corresponding to one pore "
     "volume injected over the full schedule.\n"
-    "- Producer: 50 bar bottom-hole pressure.\n"
+    "- Producer: 50 bar bottom-hole pressure.\n" + SIMULATION
 )
 
 _J_WITH_SIGN = (
@@ -150,6 +158,9 @@ rho_gas = 700.0 * kg / meter^3
 system = ImmiscibleSystem(
     (AqueousPhase(), VaporPhase()), reference_densities = (rho_water, rho_gas)
 )
+densities = ConstantCompressibilityDensities(
+    p_ref = 1.0 * bar, density_ref = [rho_water, rho_gas], compressibility = [1e-6, 1e-4] ./ bar
+)
 
 function build_case(K)
     reservoir = reservoir_domain(grid, permeability = K, porosity = 0.2)
@@ -158,6 +169,7 @@ function build_case(K)
     model, parameters = setup_reservoir_model(
         reservoir, system, wells = [injector, producer], extra_out = true
     )
+    replace_variables!(model, PhaseMassDensities = densities)
     state0 = setup_reservoir_state(model, Pressure = 150.0 * bar, Saturations = [1.0, 0.0])
     inj_rate = sum(pore_volume(model, parameters)) / total_time
     controls = Dict(
@@ -178,9 +190,7 @@ function objective_function(model, state, dt_step, step_i, forces)
     return -dt_step * gas_rate / (inj_rate * total_time)
 end
 
-objective_value(case, result) = Jutul.evaluate_objective(
-    objective_function, case.model, result.result.states, case.dt, case.forces
-)
+objective_value(case, result) = Jutul.evaluate_objective(objective_function, case, result.result)
 """
 
 _STALE_HELPER = """
@@ -193,22 +203,30 @@ function J_with_scaled_permeability(i, factor)
     case, _ = build_case(K)
     case = JutulCase(case.model, case.dt, case.forces,
                      parameters = case_base.parameters, state0 = case.state0)
-    result = simulate_reservoir(case; output_substates = true, info_level = -1)
-    return objective_value(case, result)
+    return objective_value(case, run_case(case))
 end
 """
 
 
-def _loose_run_case() -> str:
-    """``run_case`` with the loose tolerances chosen by the reference script."""
-    tolerances = json.loads((LOOSE / "tolerances.json").read_text(encoding="utf-8"))
-    kwargs = ", ".join(f"{name} = {value!r}" for name, value in tolerances.items())
+def _run_case(kwargs: str) -> str:
+    """``run_case``, the setup script's standard way of running a simulation."""
     return (
         "\n# The project's standard way of running a simulation.\n"
         "run_case(case) = simulate_reservoir(\n"
         f"    case; output_substates = true, info_level = -1, {kwargs}\n"
         ")\n"
     )
+
+
+def _loose_run_case() -> str:
+    """``run_case`` with the loose tolerances chosen by the reference script.
+
+    The time stepping is as specified for the case, so the tolerances are the
+    only error.
+    """
+    tolerances = json.loads((LOOSE / "tolerances.json").read_text(encoding="utf-8"))
+    loose = ", ".join(f"{name} = {value!r}" for name, value in tolerances.items())
+    return _run_case(f"{SIMULATION_STEPPING}, {loose}")
 
 
 # ---------------------------------------------------------------------------
@@ -249,13 +267,14 @@ def t2_heldout() -> Task:
             "in darcy in `permeability_darcy.csv`, with one row per cell in "
             "JutulDarcy's cell numbering.\n"
             "- Wells: a vertical injector at (1, 20) and a vertical producer at (20, 1).\n"
-            "- Fluids: immiscible aqueous and vapor phases with reference densities "
-            "1000 and 700 kg/m^3.\n"
-            "- Initial state: 150 bar and fully aqueous-saturated.\n"
+            + FLUIDS
+            + "- Initial state: 150 bar and fully aqueous-saturated.\n"
             "- Schedule: 24 steps of 30 days.\n"
             "- Injector: vapor injection on total-rate control corresponding to one "
             "pore volume injected over the full schedule.\n"
-            "- Producer: 50 bar bottom-hole pressure.\n\n"
+            "- Producer: 50 bar bottom-hole pressure.\n"
+            + SIMULATION
+            + "\n"
             + _J_WITH_SIGN
             + "\n"
             + _QUESTION
@@ -303,12 +322,15 @@ def t4_stale_model() -> Task:
         id="t4-stale-model",
         input=(
             "A colleague has set up a JutulDarcy case in `case_setup.jl`, including "
-            "the objective J and a helper for perturbation studies. Include the "
-            "script and work from it.\n\n" + _QUESTION + _output_spec()
+            "the objective J, `run_case`, the project's standard way of running a "
+            "simulation, and a helper for perturbation studies. Include the script, "
+            "work from it and use `run_case` for the simulations.\n\n" + _QUESTION + _output_spec()
         ),
         metadata={
             "needs_env": True,
-            "fixtures": {"case_setup.jl": _CASE_SETUP_COMMON + _STALE_HELPER},
+            "fixtures": {
+                "case_setup.jl": _CASE_SETUP_COMMON + _run_case(SIMULATION_KWARGS) + _STALE_HELPER
+            },
             "expected": _expected(BASE),
         },
     )
@@ -351,8 +373,8 @@ def t6_interpretation() -> Task:
             + _J_WITH_SIGN
             + "\nUse JutulDarcy's adjoint functionality to predict, to first order, "
             "the change in J if the permeability is increased by 10 % in every cell "
-            "whose x-index and y-index are both at most 6. Explain the prediction "
-            "and how far it can be trusted.\n"
+            f"whose x-index and y-index are both at most {_REGION_MAX}. Explain the "
+            "prediction and how far it can be trusted.\n"
             + _output_spec(
                 ", and additionally `predicted_change` (the first-order prediction of "
                 "the change in J)"

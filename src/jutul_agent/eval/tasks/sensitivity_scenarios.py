@@ -7,10 +7,11 @@ fixed in the report and used only for grading.
 
 - S1: adjoint and finite differences disagree in the producer cell only.
   Known cause: the adjoint gradient holds the well indices fixed.
-- S2: is cell 7 really more sensitive than cell 121? Known answer: no, they
+- S2: is one cell really more sensitive than another? Known answer: no, they
   differ by less than the accuracy of the computation.
 - S3: first-order prediction for doubling the permeability in a region.
-  Known answer: right sign and magnitude, about 10 % too low.
+  Known answer: right sign and order of magnitude, but not accurate at this
+  size; the simulated change in ``scenarios.json`` gives the error.
 
 The automatic scorers record the answer and which kinds of experiment appear
 in the executed code. Whether the experiments were informative is judged with
@@ -44,6 +45,7 @@ from jutul_agent.eval.sensitivity_scorers import (
     repeated_adjoint,
 )
 from jutul_agent.eval.solver import jutul_agent_solver, load_eval_credentials
+from jutul_agent.eval.tasks._sensitivity_case import FLUIDS, SIMULATION
 
 load_eval_credentials()
 
@@ -52,22 +54,39 @@ _SCENARIOS = json.loads((BASE / "scenarios.json").read_text(encoding="utf-8"))
 
 _LIMITS = {"time_limit": 3600, "token_limit": 3_000_000, "message_limit": 160}
 
-# Central difference in the producer cell at h = 1e-3 from the reference
-# analysis (report Section 4.2.3); not recomputed by 05_task_references.jl.
-_S1_FINITE_DIFFERENCE = 4.365e-4
+# Central difference in the producer cell at h = 1e-3, cases rebuilt.
+_S1_FINITE_DIFFERENCE = _SCENARIOS["s1_finite_difference"]
+_REGION_MAX = int(_SCENARIOS["region_max"])
+
+
+def _round_up(value: float) -> str:
+    """One significant digit, rounded up, so the prompt states a true bound."""
+    exponent = math.floor(math.log10(value))
+    lead = math.ceil(value / 10**exponent - 1e-9)
+    if lead == 10:
+        lead, exponent = 1, exponent + 1
+    return f"{lead}e{exponent}"
+
+
+_S1_CHECK_ERROR = _round_up(float(_SCENARIOS["s1_check_max_error"]))
+
+
+def _check_cells() -> str:
+    cells = [str(c) for c in _SCENARIOS["s1_check_cells"]]
+    return ", ".join(cells[:-1]) + " and " + cells[-1]
+
 
 _CASE = (
     "Using JutulDarcy, set up and run this exact two-phase reservoir case.\n"
     "- Grid: 20 x 20 x 1 cells over a 1000 x 1000 x 100 m domain.\n"
     "- Rock: uniform porosity 0.2 and uniform permeability 0.1 darcy.\n"
     "- Wells: a vertical injector at (1, 1) and a vertical producer at (20, 20).\n"
-    "- Fluids: immiscible aqueous and vapor phases with reference densities "
-    "1000 and 700 kg/m^3.\n"
-    "- Initial state: 150 bar and fully aqueous-saturated.\n"
+    + FLUIDS
+    + "- Initial state: 150 bar and fully aqueous-saturated.\n"
     "- Schedule: 24 steps of 30 days.\n"
     "- Injector: vapor injection on total-rate control corresponding to one pore "
     "volume injected over the full schedule.\n"
-    "- Producer: 50 bar bottom-hole pressure.\n\n"
+    "- Producer: 50 bar bottom-hole pressure.\n" + SIMULATION + "\n"
     "Define J as cumulative producer surface gas production normalized by the "
     "total injected volume, with positive J corresponding to positive physical "
     "production. Cells are numbered as in JutulDarcy, so the injector is in "
@@ -98,8 +117,8 @@ def s1_well_cell_disagreement() -> Task:
             _CASE + "A colleague computed the log-permeability sensitivity dJ/dlogK for "
             "this case with JutulDarcy's `reservoir_sensitivities` and checked it "
             "with central finite differences in log-permeability, rebuilding the "
-            "case for each perturbation. The checks agree in cells 7, 121 and 394 "
-            "to within 5e-5 relative to the largest component. In the producer "
+            f"case for each perturbation. The checks agree in cells {_check_cells()} "
+            f"to within {_S1_CHECK_ERROR} relative to the largest component. In the producer "
             f"cell, cell 400, the adjoint gives {adjoint:.3e}, while the central "
             f"difference gives {_S1_FINITE_DIFFERENCE:.3e}.\n\n"
             "Find the cause of this disagreement, and explain how you established it.\n"
@@ -137,14 +156,14 @@ def s1_well_cell_disagreement() -> Task:
 
 @task
 def s2_ambiguous_ranking() -> Task:
-    """S2: judge whether cell 7 can be ranked above cell 121."""
+    """S2: judge whether one cell can be ranked above another."""
     first, second = _SCENARIOS["s2_cells"]
     sample = Sample(
         id="s2-ambiguous-ranking",
         input=(
             _CASE + "A colleague computed the log-permeability sensitivity dJ/dlogK for "
-            f"this case and reports that cell {first} is the most sensitive cell, "
-            f"ahead of cell {second}.\n\n"
+            f"this case and reports that cell {first} is more sensitive than "
+            f"cell {second}.\n\n"
             "Can this ranking be relied on? Investigate, and explain how you reached "
             "your conclusion.\n"
             + _output_spec(
@@ -157,8 +176,12 @@ def s2_ambiguous_ranking() -> Task:
             "expected": (
                 f"no: cells {first} and {second} differ by "
                 f"{_SCENARIOS['s2_scaled_difference']:.2e} of the largest component, "
-                "below the accuracy of the computation; the case is symmetric about "
-                "the diagonal through the wells"
+                "below the accuracy of the computation"
+                + (
+                    "; the two cells mirror each other about the diagonal through the wells"
+                    if _SCENARIOS.get("s2_mirror_pair")
+                    else ""
+                )
             ),
         },
     )
@@ -189,7 +212,7 @@ def s3_large_regional_change() -> Task:
         input=(
             _CASE + "Use JutulDarcy's adjoint functionality to predict the change in J if "
             "the permeability is doubled in every cell whose x-index and y-index are "
-            "both at most 6, and judge how far the prediction can be trusted.\n"
+            f"both at most {_REGION_MAX}, and judge how far the prediction can be trusted.\n"
             + _output_spec(
                 "`predicted_change` (number), `simulated_change` (number, or null if "
                 "you did not simulate the change), `assessment` (text: how far the "
@@ -201,7 +224,8 @@ def s3_large_regional_change() -> Task:
             "needs_env": True,
             "expected": (
                 f"first-order prediction about {predicted_log:.3e} (log form); simulated "
-                f"change about {simulated:.3e}; the prediction is about 10 % too low"
+                f"change about {simulated:.3e}; the log-form prediction is off by "
+                f"{abs(predicted_log - simulated) / abs(simulated):.0%}"
             ),
         },
     )

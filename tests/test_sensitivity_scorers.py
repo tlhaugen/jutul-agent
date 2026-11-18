@@ -116,6 +116,17 @@ async def test_missing_files_fail_without_crashing(tmp_path: Path) -> None:
     assert "no result" in (outcome.explanation or "")
 
 
+async def test_tau_from_reference_overrides_eps_ref(tmp_path: Path) -> None:
+    ref = _reference(tmp_path)
+    data = json.loads((ref / "reference.json").read_text())
+    data["tau"] = 0.5
+    (ref / "reference.json").write_text(json.dumps(data))
+    off = {c: 1.3 * v for c, v in FULL.items()}
+    assert (await gradient_correct(ref)(_state(tmp_path / "a", off, None), Target(""))).value == "C"
+    (ref / "reference.json").write_text(json.dumps({k: v for k, v in data.items() if k != "tau"}))
+    assert (await gradient_correct(ref)(_state(tmp_path / "b", off, None), Target(""))).value == "I"
+
+
 async def test_predicted_change_accepts_both_first_order_forms(tmp_path: Path) -> None:
     ref = _reference(tmp_path)
     log_form = _state(tmp_path / "a", None, {"predicted_change": 1.0e-3})

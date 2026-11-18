@@ -269,3 +269,30 @@ async def test_case_tolerances_do_not_count_as_tightened(tmp_path: Path) -> None
     )
     assert (await ran_tightened_tolerances()(case, Target(""))).value == "I"
     assert (await ran_tightened_tolerances()(tighter, Target(""))).value == "C"
+
+
+async def test_hand_written_gradient_is_recorded(tmp_path: Path) -> None:
+    from jutul_agent.eval.sensitivity_scorers import gradient_written_by_code
+
+    hand = _scenario_state(
+        tmp_path / "a",
+        [
+            'write_csv("dJ_dlogK.csv", g)',
+            ("write_file", {"file_path": "/ws/dJ_dlogK.csv", "content": "cell,dJ_dlogK\n1,0.1\n"}),
+        ],
+        None,
+    )
+    code = _scenario_state(
+        tmp_path / "b",
+        [
+            ("write_file", {"file_path": "/ws/dJ_dlogK.csv", "content": "cell,dJ_dlogK\n"}),
+            'open("dJ_dlogK.csv", "w") do io; println(io, "cell,dJ_dlogK"); end',
+        ],
+        None,
+    )
+    for state in (hand, code):
+        (Path(state.store.get(STORE_WORKSPACE)) / GRADIENT_FILE).write_text(
+            "cell,dJ_dlogK\n1,0.1\n"
+        )
+    assert (await gradient_written_by_code()(hand, Target(""))).value == "I"
+    assert (await gradient_written_by_code()(code, Target(""))).value == "C"

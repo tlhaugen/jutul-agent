@@ -352,11 +352,15 @@ def _expand(code: str, files: dict[str, str], root: Path | None, depth: int = 0)
     return "\n".join(parts)
 
 
-def executed_julia_code(state: TaskState) -> list[str]:
-    """The code of each executed Julia call, with the files it runs expanded."""
+def _walk(state: TaskState) -> list[tuple[str, str]]:
+    """The trace in order as ``("write", file name)`` and ``("exec", code)`` items.
+
+    ``write`` marks a file written or edited through the file tools; ``exec``
+    is an executed Julia call, expanded with the files it runs.
+    """
     root = _workspace(state)
     files: dict[str, str] = {}
-    executed: list[str] = []
+    items: list[tuple[str, str]] = []
     for event in _trace_events(state):
         if event.kind != schema.TOOL_CALL:
             continue
@@ -365,19 +369,26 @@ def executed_julia_code(state: TaskState) -> list[str]:
         path = Path(_arg(args, "file_path", "path")).name
         if name == "write_file" and path:
             files[path] = _arg(args, "content", "text")
-        elif name == "edit_file" and path in files:
+            items.append(("write", path))
+        elif name == "edit_file" and path:
             old, new = _arg(args, "old_string", "old_str"), _arg(args, "new_string", "new_str")
-            if old:
+            if path in files and old:
                 count = -1 if args.get("replace_all") else 1
                 files[path] = files[path].replace(old, new, count)
+            items.append(("write", path))
         elif name in ("run_julia", "plot_julia"):
-            executed.append(_expand(_arg(args, "code"), files, root))
+            items.append(("exec", _expand(_arg(args, "code"), files, root)))
         elif name == "execute":
             scripts = _JULIA_SCRIPT.findall(_arg(args, "command"))
             if scripts:
                 code = "\n".join(f'include("{script}")' for script in scripts)
-                executed.append(_expand(code, files, root))
-    return executed
+                items.append(("exec", _expand(code, files, root)))
+    return items
+
+
+def executed_julia_code(state: TaskState) -> list[str]:
+    """The code of each executed Julia call, with the files it runs expanded."""
+    return [code for kind, code in _walk(state) if kind == "exec"]
 
 
 def _code_hits(state: TaskState, matches: Any) -> int:
@@ -414,6 +425,36 @@ def julia_calls_matching(pattern: str, min_calls: int) -> Scorer:
     judge of whether a verification was actually carried out.
     """
     return _code_check(pattern, f"pattern {pattern!r}", min_calls)
+
+
+@scorer(metrics=[accuracy()])
+def gradient_written_by_code() -> Scorer:
+    """Record whether ``dJ_dlogK.csv`` was written by code (not a grade).
+
+    The file counts as hand-written when its last writer is the file tool
+    (``write_file`` or ``edit_file``), so that the values were typed by the
+    model rather than produced by the computation. It counts as written by
+    code when the last writer is executed Julia code that names the file.
+    """
+    stem = GRADIENT_FILE.removesuffix(".csv")
+
+    async def score(state: TaskState, target: Target) -> Score:
+        root = _workspace(state)
+        if root is None or not (root / GRADIENT_FILE).exists():
+            return Score(value=INCORRECT, explanation=f"no {GRADIENT_FILE}")
+        writer = "unknown"
+        for kind, item in _walk(state):
+            if kind == "write" and item == GRADIENT_FILE:
+                writer = "file tool"
+            elif kind == "exec" and stem in item:
+                writer = "Julia code"
+        ok = writer != "file tool"
+        return Score(
+            value=CORRECT if ok else INCORRECT,
+            explanation=f"last writer of {GRADIENT_FILE}: {writer}",
+        )
+
+    return score
 
 
 # ---------------------------------------------------------------------------

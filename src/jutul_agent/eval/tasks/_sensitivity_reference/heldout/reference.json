@@ -1,7 +1,9 @@
 {
-  "J": 0.0252095334469545,
-  "eps_ref": 0.0006531881622825464,
-  "max_abs_gradient": 0.0006442554154370411,
-  "accepted_top_cells": [385],
+  "J": 0.09107957226155237,
+  "eps_ref": 2.1696088246821943e-7,
+  "eps": 0.0001,
+  "tau": 0.001,
+  "max_abs_gradient": 0.012743861729156161,
+  "accepted_top_cells": [20],
   "jutuldarcy_version": "0.3.11"
 }

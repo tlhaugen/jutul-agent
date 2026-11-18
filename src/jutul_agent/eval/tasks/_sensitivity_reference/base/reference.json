@@ -1,12 +1,14 @@
 {
-  "J": 0.03562948869275884,
-  "eps_ref": 0.0002413614506765543,
-  "max_abs_gradient": 0.0006478876098425024,
-  "accepted_top_cells": [7, 121],
+  "J": 0.12037605989545438,
+  "eps_ref": 2.3594040990829003e-6,
+  "eps": 0.0001,
+  "tau": 0.001,
+  "max_abs_gradient": 0.011526605208369935,
+  "accepted_top_cells": [400],
   "region_x_max": 6,
   "region_y_max": 6,
-  "predicted_change_log": 0.00032985552311479073,
-  "predicted_change_linear": 0.00034608635068362624,
-  "simulated_change": 0.00033332454283953317,
+  "predicted_change_log": 0.0005388596433554894,
+  "predicted_change_linear": 0.0005653747002280204,
+  "simulated_change": 0.0005451394951895838,
   "jutuldarcy_version": "0.3.11"
 }

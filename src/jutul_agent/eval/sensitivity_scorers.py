@@ -47,6 +47,7 @@ from jutul_agent.eval.solver import STORE_WORKSPACE
 from jutul_agent.trace import schema
 
 REPORT_FILE = "sensitivity_report.json"
+INVESTIGATION_FILE = "investigation_report.json"
 GRADIENT_FILE = "dJ_dlogK.csv"
 
 # A statement that the gradient holds the well indices fixed.
@@ -81,16 +82,21 @@ def _workspace(state: TaskState) -> Path | None:
     return Path(root) if root else None
 
 
-def read_report(state: TaskState) -> dict[str, Any] | None:
-    """The agent's JSON report, or ``None`` when it is missing or malformed."""
+def _read_json(state: TaskState, name: str) -> dict[str, Any] | None:
+    """A JSON object from the workspace, or ``None`` when missing or malformed."""
     root = _workspace(state)
-    if root is None or not (root / REPORT_FILE).exists():
+    if root is None or not (root / name).exists():
         return None
     try:
-        data = json.loads((root / REPORT_FILE).read_text(encoding="utf-8"))
+        data = json.loads((root / name).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
+
+
+def read_report(state: TaskState) -> dict[str, Any] | None:
+    """The agent's JSON report, or ``None`` when it is missing or malformed."""
+    return _read_json(state, REPORT_FILE)
 
 
 def read_gradient(state: TaskState) -> dict[int, float] | None:
@@ -319,6 +325,129 @@ def julia_calls_matching(pattern: str, min_calls: int) -> Scorer:
         return Score(
             value=CORRECT if count >= min_calls else INCORRECT,
             explanation=f"{count} Julia calls matched {pattern!r}, need {min_calls}",
+        )
+
+    return score
+
+
+# ---------------------------------------------------------------------------
+# Investigation scenarios (S1-S3): which experiments were run, and the answer.
+#
+# The trace checks are pattern matches on the Julia code the agent executed.
+# They record whether a kind of experiment appears in the trace, not whether
+# it was set up correctly; the manual rubric judges that.
+
+# A literal list or tuple of three or more small numbers, or a power range such
+# as ``10.0 .^ (-1:-1:-6)``: the usual shapes of a sweep over step sizes.
+_SMALL = r"(?:\d*\.?\d+e-\d+|0\.0*[1-9]\d*|10\.?0?\s*\^\s*-?\(?-?\d+\)?)"
+_STEP_SWEEP = (
+    rf"[\[(]\s*{_SMALL}\s*(?:,\s*{_SMALL}\s*){{2,}}[\])]"
+    r"|10\.?0?\s*\.\^\s*\(?\s*-?\d"
+)
+_TIGHT_TOL = r"\b(?:tol_cnv|tol_mb|rtol)\s*="
+_WELL_INDICES = r"WellIndices|solve_adjoint_sensitivities"
+_SIMULATE = r"simulate_reservoir\s*\(|run_case\s*\("
+
+
+def _code_hits(state: TaskState, compiled: re.Pattern[str]) -> int:
+    return sum(
+        1
+        for event in _trace_events(state)
+        if event.kind == schema.TOOL_CALL
+        and event.payload.get("name") in ("run_julia", "plot_julia")
+        and compiled.search(str((event.payload.get("args") or {}).get("code", "")))
+    )
+
+
+def _code_check(pattern: str, what: str, min_calls: int = 1) -> Scorer:
+    compiled = re.compile(pattern)
+
+    async def score(state: TaskState, target: Target) -> Score:
+        count = _code_hits(state, compiled)
+        return Score(
+            value=CORRECT if count >= min_calls else INCORRECT,
+            explanation=f"{what}: {count} Julia calls matched, need {min_calls}",
+        )
+
+    return score
+
+
+@scorer(metrics=[accuracy()])
+def ran_step_size_sweep() -> Scorer:
+    """Whether the executed code contains a sweep over perturbation sizes."""
+    return _code_check(_STEP_SWEEP, "step-size sweep")
+
+
+@scorer(metrics=[accuracy()])
+def ran_tightened_tolerances() -> Scorer:
+    """Whether the executed code sets solver tolerances explicitly."""
+    return _code_check(_TIGHT_TOL, "explicit solver tolerances")
+
+
+@scorer(metrics=[accuracy()])
+def examined_well_indices() -> Scorer:
+    """Whether the executed code touches the well indices or their sensitivities."""
+    return _code_check(_WELL_INDICES, "well indices")
+
+
+@scorer(metrics=[accuracy()])
+def ran_perturbed_simulations(min_calls: int = 2) -> Scorer:
+    """Whether simulations were run in at least ``min_calls`` Julia calls."""
+    return _code_check(_SIMULATE, "simulations", min_calls)
+
+
+@scorer(metrics=[accuracy()])
+def repeated_adjoint(min_calls: int = 2) -> Scorer:
+    """Whether the adjoint was computed in at least ``min_calls`` Julia calls."""
+    return _code_check(
+        r"(?:reservoir_sensitivities|solve_adjoint_sensitivities)\s*\(",
+        "adjoint computations",
+        min_calls,
+    )
+
+
+@scorer(metrics=[accuracy()])
+def identified_well_index_cause() -> Scorer:
+    """S1: whether the reported cause names the well indices."""
+
+    async def score(state: TaskState, target: Target) -> Score:
+        report = _read_json(state, INVESTIGATION_FILE) or {}
+        cause = str(report.get("cause", ""))
+        ok = bool(_WI_FIXED_STATEMENT.search(cause))
+        return Score(value=CORRECT if ok else INCORRECT, explanation=f"cause: {cause[:200]!r}")
+
+    return score
+
+
+@scorer(metrics=[accuracy()])
+def judged_ranking_unreliable() -> Scorer:
+    """S2: whether the agent concludes that the ranking cannot be relied on."""
+
+    async def score(state: TaskState, target: Target) -> Score:
+        report = _read_json(state, INVESTIGATION_FILE) or {}
+        value = report.get("ranking_reliable")
+        return Score(
+            value=CORRECT if value is False else INCORRECT,
+            explanation=f"ranking_reliable = {value!r}, known answer false",
+        )
+
+    return score
+
+
+@scorer(metrics=[accuracy()])
+def investigation_value_close(key: str, accepted: list[float], rel_tol: float) -> Scorer:
+    """Whether a number in the investigation report matches an accepted value."""
+
+    async def score(state: TaskState, target: Target) -> Score:
+        report = _read_json(state, INVESTIGATION_FILE) or {}
+        try:
+            value = float(report[key])
+        except (KeyError, TypeError, ValueError):
+            value = math.nan
+        ok = math.isfinite(value) and any(abs(value - a) <= rel_tol * abs(a) for a in accepted)
+        return Score(
+            value=CORRECT if ok else INCORRECT,
+            explanation=f"{key} = {value}, accepted {accepted} (rel. tol {rel_tol})",
         )
 
     return score

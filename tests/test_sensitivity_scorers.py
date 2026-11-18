@@ -124,3 +124,88 @@ async def test_predicted_change_accepts_both_first_order_forms(tmp_path: Path) -
     assert (await predicted_change_close(ref)(log_form, Target(""))).value == "C"
     assert (await predicted_change_close(ref)(linear_form, Target(""))).value == "C"
     assert (await predicted_change_close(ref)(wrong, Target(""))).value == "I"
+
+
+# ---------------------------------------------------------------------------
+# Investigation scenarios: trace checks and answers.
+
+
+def _scenario_state(tmp_path: Path, codes: list[str], report: dict | None):
+    """A state with a synthetic trace of ``run_julia`` calls and an investigation report."""
+    from jutul_agent.eval.sensitivity_scorers import INVESTIGATION_FILE
+    from jutul_agent.eval.solver import STORE_TRACE_DB
+    from jutul_agent.trace import TraceLog
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    db = tmp_path / "trace.sqlite"
+    log = TraceLog(db)
+    for code in codes:
+        log.append("tool_call", {"name": "run_julia", "args": {"code": code}})
+    log.close()
+    if report is not None:
+        (tmp_path / INVESTIGATION_FILE).write_text(json.dumps(report))
+    store = Store()
+    store.set(STORE_TRACE_DB, str(db))
+    store.set(STORE_WORKSPACE, str(tmp_path))
+    return SimpleNamespace(store=store, output=SimpleNamespace(completion=""))
+
+
+async def test_trace_checks_recognise_experiments(tmp_path: Path) -> None:
+    from jutul_agent.eval.sensitivity_scorers import (
+        examined_well_indices,
+        ran_perturbed_simulations,
+        ran_step_size_sweep,
+        ran_tightened_tolerances,
+    )
+
+    state = _scenario_state(
+        tmp_path,
+        [
+            "result = simulate_reservoir(case)",
+            "for h in (1e-1, 1e-2, 1e-3)\n  r = simulate_reservoir(build(h))\nend",
+            "res = simulate_reservoir(case; tol_cnv = 1e-6, tol_mb = 1e-10)",
+            "sens = Jutul.solve_adjoint_sensitivities(case, result.result, obj)",
+        ],
+        None,
+    )
+    for check in (
+        ran_step_size_sweep(),
+        ran_tightened_tolerances(),
+        examined_well_indices(),
+        ran_perturbed_simulations(2),
+    ):
+        assert (await check(state, Target(""))).value == "C"
+
+
+async def test_trace_checks_reject_absent_experiments(tmp_path: Path) -> None:
+    from jutul_agent.eval.sensitivity_scorers import (
+        examined_well_indices,
+        ran_step_size_sweep,
+        ran_tightened_tolerances,
+    )
+
+    state = _scenario_state(tmp_path, ["g = reservoir_sensitivities(case, result, obj)"], None)
+    for check in (ran_step_size_sweep(), ran_tightened_tolerances(), examined_well_indices()):
+        assert (await check(state, Target(""))).value == "I"
+
+
+async def test_scenario_answers(tmp_path: Path) -> None:
+    from jutul_agent.eval.sensitivity_scorers import (
+        identified_well_index_cause,
+        investigation_value_close,
+        judged_ranking_unreliable,
+    )
+
+    s1 = _scenario_state(
+        tmp_path / "s1",
+        [],
+        {"cause": "The adjoint holds the well indices fixed.", "corrected_value": 4.36e-4},
+    )
+    assert (await identified_well_index_cause()(s1, Target(""))).value == "C"
+    close = investigation_value_close("corrected_value", [4.363e-4], 0.02)
+    assert (await close(s1, Target(""))).value == "C"
+
+    s2_right = _scenario_state(tmp_path / "s2a", [], {"ranking_reliable": False})
+    s2_wrong = _scenario_state(tmp_path / "s2b", [], {"ranking_reliable": True})
+    assert (await judged_ranking_unreliable()(s2_right, Target(""))).value == "C"
+    assert (await judged_ranking_unreliable()(s2_wrong, Target(""))).value == "I"

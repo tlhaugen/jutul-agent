@@ -141,8 +141,12 @@ async def test_predicted_change_accepts_both_first_order_forms(tmp_path: Path) -
 # Investigation scenarios: trace checks and answers.
 
 
-def _scenario_state(tmp_path: Path, codes: list[str], report: dict | None):
-    """A state with a synthetic trace of ``run_julia`` calls and an investigation report."""
+def _scenario_state(tmp_path: Path, codes: list, report: dict | None):
+    """A state with a synthetic trace and an investigation report.
+
+    Each entry of ``codes`` is the code of a ``run_julia`` call, or a
+    ``(tool name, args)`` pair for any other tool call.
+    """
     from jutul_agent.eval.sensitivity_scorers import INVESTIGATION_FILE
     from jutul_agent.eval.solver import STORE_TRACE_DB
     from jutul_agent.trace import TraceLog
@@ -151,7 +155,8 @@ def _scenario_state(tmp_path: Path, codes: list[str], report: dict | None):
     db = tmp_path / "trace.sqlite"
     log = TraceLog(db)
     for code in codes:
-        log.append("tool_call", {"name": "run_julia", "args": {"code": code}})
+        name, args = code if isinstance(code, tuple) else ("run_julia", {"code": code})
+        log.append("tool_call", {"name": name, "args": args})
     log.close()
     if report is not None:
         (tmp_path / INVESTIGATION_FILE).write_text(json.dumps(report))
@@ -174,7 +179,7 @@ async def test_trace_checks_recognise_experiments(tmp_path: Path) -> None:
         [
             "result = simulate_reservoir(case)",
             "for h in (1e-1, 1e-2, 1e-3)\n  r = simulate_reservoir(build(h))\nend",
-            "res = simulate_reservoir(case; tol_cnv = 1e-6, tol_mb = 1e-10)",
+            "res = simulate_reservoir(case; tol_cnv = 1e-8, tol_mb = 1e-12)",
             "sens = Jutul.solve_adjoint_sensitivities(case, result.result, obj)",
         ],
         None,
@@ -220,3 +225,47 @@ async def test_scenario_answers(tmp_path: Path) -> None:
     s2_wrong = _scenario_state(tmp_path / "s2b", [], {"ranking_reliable": True})
     assert (await judged_ranking_unreliable()(s2_right, Target(""))).value == "C"
     assert (await judged_ranking_unreliable()(s2_wrong, Target(""))).value == "I"
+
+
+async def test_trace_checks_follow_included_and_shell_run_files(tmp_path: Path) -> None:
+    from jutul_agent.eval.sensitivity_scorers import (
+        julia_calls_matching,
+        ran_step_size_sweep,
+        ran_tightened_tolerances,
+    )
+
+    state = _scenario_state(
+        tmp_path,
+        [
+            ("write_file", {"file_path": "/validate.jl", "content": "r = run_case(case)\n"}),
+            (
+                "edit_file",
+                {
+                    "file_path": "/validate.jl",
+                    "old_string": "r = run_case(case)",
+                    "new_string": "for h in (1e-2, 1e-3, 1e-4)\n  r = simulate_reservoir(c)\nend",
+                },
+            ),
+            'include("validate.jl")',
+            ("execute", {"command": "cd /ws && julia validate.jl"}),
+        ],
+        None,
+    )
+    assert (await ran_step_size_sweep()(state, Target(""))).value == "C"
+    assert (
+        await julia_calls_matching(r"simulate_reservoir\s*\(", 2)(state, Target(""))
+    ).value == "C"
+    assert (await ran_tightened_tolerances()(state, Target(""))).value == "I"
+
+
+async def test_case_tolerances_do_not_count_as_tightened(tmp_path: Path) -> None:
+    from jutul_agent.eval.sensitivity_scorers import ran_tightened_tolerances
+
+    case = _scenario_state(
+        tmp_path / "a", ["simulate_reservoir(c; tol_cnv = 1e-6, tol_mb = 1e-10)"], None
+    )
+    tighter = _scenario_state(
+        tmp_path / "b", ["simulate_reservoir(c; tol_cnv = 1e-6, tol_mb = 1e-12)"], None
+    )
+    assert (await ran_tightened_tolerances()(case, Target(""))).value == "I"
+    assert (await ran_tightened_tolerances()(tighter, Target(""))).value == "C"

@@ -29,7 +29,6 @@ from inspect_ai import Task, task
 from inspect_ai.dataset import Sample
 
 from jutul_agent.eval.scorers import (
-    julia_code_matches,
     julia_probe_count,
     no_interpreters_via_execute,
     tool_call_count,
@@ -37,6 +36,7 @@ from jutul_agent.eval.scorers import (
 )
 from jutul_agent.eval.sensitivity_scorers import (
     claims_validated,
+    executed_code_matches,
     gradient_correct,
     julia_calls_matching,
     objective_correct,
@@ -118,7 +118,7 @@ def _scorers(ref_dir: Path) -> list:
         claims_validated(),
         objective_correct(ref_dir),
         top_cell_accepted(ref_dir),
-        julia_code_matches(r"(reservoir_sensitivities|solve_adjoint_sensitivities)\s*\("),
+        executed_code_matches(r"(reservoir_sensitivities|solve_adjoint_sensitivities)\s*\("),
         julia_calls_matching(r"simulate_reservoir\s*\(|run_case\s*\(", 2),
         used_tools(["run_julia"]),
         no_interpreters_via_execute(),

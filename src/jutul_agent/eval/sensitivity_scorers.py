@@ -312,30 +312,108 @@ def predicted_change_close(ref_dir: Path, rel_tol: float = 0.01) -> Scorer:
     return score
 
 
+# ---------------------------------------------------------------------------
+# Executed Julia code.
+#
+# Agents often write their code to ``.jl`` files and run them with
+# ``include`` in the session, or (against the guidance) with ``julia file.jl``
+# in the shell. A check that read only the code typed into ``run_julia`` would
+# miss those experiments, so each executed call is expanded with the latest
+# contents of the files it runs, as written or edited through the file tools.
+# Files the agent did not write, such as task fixtures, are read from the
+# workspace.
+
+_INCLUDE = re.compile(r"""include\(\s*["']([^"']+)["']""")
+_JULIA_SCRIPT = re.compile(r"""\bjulia\b[^\n;&|]*?([\w./-]+\.jl)""")
+
+
+def _arg(args: dict[str, Any], *names: str) -> str:
+    for name in names:
+        if args.get(name) is not None:
+            return str(args[name])
+    return ""
+
+
+def _expand(code: str, files: dict[str, str], root: Path | None, depth: int = 0) -> str:
+    """``code`` followed by the contents of the files it includes, recursively."""
+    if depth > 3:
+        return code
+    parts = [code]
+    for path in _INCLUDE.findall(code):
+        name = Path(path).name
+        included = files.get(name)
+        if included is None and root is not None and (root / path).is_file():
+            try:
+                included = (root / path).read_text(encoding="utf-8")
+            except OSError:
+                included = None
+        if included:
+            parts.append(_expand(included, files, root, depth + 1))
+    return "\n".join(parts)
+
+
+def executed_julia_code(state: TaskState) -> list[str]:
+    """The code of each executed Julia call, with the files it runs expanded."""
+    root = _workspace(state)
+    files: dict[str, str] = {}
+    executed: list[str] = []
+    for event in _trace_events(state):
+        if event.kind != schema.TOOL_CALL:
+            continue
+        name = event.payload.get("name")
+        args = event.payload.get("args") or {}
+        path = Path(_arg(args, "file_path", "path")).name
+        if name == "write_file" and path:
+            files[path] = _arg(args, "content", "text")
+        elif name == "edit_file" and path in files:
+            old, new = _arg(args, "old_string", "old_str"), _arg(args, "new_string", "new_str")
+            if old:
+                count = -1 if args.get("replace_all") else 1
+                files[path] = files[path].replace(old, new, count)
+        elif name in ("run_julia", "plot_julia"):
+            executed.append(_expand(_arg(args, "code"), files, root))
+        elif name == "execute":
+            scripts = _JULIA_SCRIPT.findall(_arg(args, "command"))
+            if scripts:
+                code = "\n".join(f'include("{script}")' for script in scripts)
+                executed.append(_expand(code, files, root))
+    return executed
+
+
+def _code_hits(state: TaskState, matches: Any) -> int:
+    """Number of executed Julia calls for which ``matches(code)`` holds."""
+    return sum(1 for code in executed_julia_code(state) if matches(code))
+
+
+def _code_check(pattern: Any, what: str, min_calls: int = 1) -> Scorer:
+    """Pass when at least ``min_calls`` executed calls match a regex or predicate."""
+    matches = re.compile(pattern).search if isinstance(pattern, str) else pattern
+
+    async def score(state: TaskState, target: Target) -> Score:
+        count = _code_hits(state, matches)
+        return Score(
+            value=CORRECT if count >= min_calls else INCORRECT,
+            explanation=f"{what}: {count} executed Julia calls matched, need {min_calls}",
+        )
+
+    return score
+
+
+@scorer(metrics=[accuracy()])
+def executed_code_matches(pattern: str) -> Scorer:
+    """Pass when executed Julia code, including the files it runs, matches ``pattern``."""
+    return _code_check(pattern, f"pattern {pattern!r}")
+
+
 @scorer(metrics=[accuracy()])
 def julia_calls_matching(pattern: str, min_calls: int) -> Scorer:
-    """Pass when at least ``min_calls`` Julia tool calls contain ``pattern``.
+    """Pass when at least ``min_calls`` executed Julia calls contain ``pattern``.
 
     A weak trace check, for example that simulations were run beyond the base
     case. A loop inside one call counts once, so the manual rubric remains the
     judge of whether a verification was actually carried out.
     """
-    compiled = re.compile(pattern)
-
-    async def score(state: TaskState, target: Target) -> Score:
-        count = sum(
-            1
-            for event in _trace_events(state)
-            if event.kind == schema.TOOL_CALL
-            and event.payload.get("name") in ("run_julia", "plot_julia")
-            and compiled.search(str((event.payload.get("args") or {}).get("code", "")))
-        )
-        return Score(
-            value=CORRECT if count >= min_calls else INCORRECT,
-            explanation=f"{count} Julia calls matched {pattern!r}, need {min_calls}",
-        )
-
-    return score
+    return _code_check(pattern, f"pattern {pattern!r}", min_calls)
 
 
 # ---------------------------------------------------------------------------
@@ -352,32 +430,22 @@ _STEP_SWEEP = (
     rf"[\[(]\s*{_SMALL}\s*(?:,\s*{_SMALL}\s*){{2,}}[\])]"
     r"|10\.?0?\s*\.\^\s*\(?\s*-?\d"
 )
-_TIGHT_TOL = r"\b(?:tol_cnv|tol_mb|rtol)\s*="
 _WELL_INDICES = r"WellIndices|solve_adjoint_sensitivities"
 _SIMULATE = r"simulate_reservoir\s*\(|run_case\s*\("
+_NUMBER = r"(\d*\.?\d+(?:[eE][-+]?\d+)?)"
 
 
-def _code_hits(state: TaskState, compiled: re.Pattern[str]) -> int:
-    return sum(
-        1
-        for event in _trace_events(state)
-        if event.kind == schema.TOOL_CALL
-        and event.payload.get("name") in ("run_julia", "plot_julia")
-        and compiled.search(str((event.payload.get("args") or {}).get("code", "")))
-    )
+def _tighter_than(tol_cnv: float, tol_mb: float) -> Any:
+    """Predicate: the code sets ``tol_cnv`` or ``tol_mb`` below the given values."""
+    cnv = re.compile(rf"\btol_cnv\s*=\s*{_NUMBER}")
+    mb = re.compile(rf"\btol_mb\s*=\s*{_NUMBER}")
 
-
-def _code_check(pattern: str, what: str, min_calls: int = 1) -> Scorer:
-    compiled = re.compile(pattern)
-
-    async def score(state: TaskState, target: Target) -> Score:
-        count = _code_hits(state, compiled)
-        return Score(
-            value=CORRECT if count >= min_calls else INCORRECT,
-            explanation=f"{what}: {count} Julia calls matched, need {min_calls}",
+    def matches(code: str) -> bool:
+        return any(float(v) < 0.99 * tol_cnv for v in cnv.findall(code)) or any(
+            float(v) < 0.99 * tol_mb for v in mb.findall(code)
         )
 
-    return score
+    return matches
 
 
 @scorer(metrics=[accuracy()])
@@ -387,9 +455,13 @@ def ran_step_size_sweep() -> Scorer:
 
 
 @scorer(metrics=[accuracy()])
-def ran_tightened_tolerances() -> Scorer:
-    """Whether the executed code sets solver tolerances explicitly."""
-    return _code_check(_TIGHT_TOL, "explicit solver tolerances")
+def ran_tightened_tolerances(tol_cnv: float = 1e-6, tol_mb: float = 1e-10) -> Scorer:
+    """Whether the executed code sets tolerances tighter than the case's own.
+
+    The case itself specifies ``tol_cnv = 1e-6`` and ``tol_mb = 1e-10``, so
+    setting those values does not count as tightening.
+    """
+    return _code_check(_tighter_than(tol_cnv, tol_mb), "tolerances tighter than the case")
 
 
 @scorer(metrics=[accuracy()])

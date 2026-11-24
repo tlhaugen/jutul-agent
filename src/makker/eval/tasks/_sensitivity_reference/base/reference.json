@@ -1,0 +1,14 @@
+{
+  "J": 0.12037605989545438,
+  "eps_ref": 2.3594040990829003e-6,
+  "eps": 0.0001,
+  "tau": 0.001,
+  "max_abs_gradient": 0.011526605208369935,
+  "accepted_top_cells": [400],
+  "region_x_max": 6,
+  "region_y_max": 6,
+  "predicted_change_log": 0.0005388596433554894,
+  "predicted_change_linear": 0.0005653747002280204,
+  "simulated_change": 0.0005451394951895838,
+  "jutuldarcy_version": "0.3.11"
+}

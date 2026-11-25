@@ -145,6 +145,18 @@ For spatial parameter fields, preserve the mapping from gradient entries to
 reservoir cells, and report cell positions both as linear index and as
 Cartesian index when the grid is structured.
 
+### Substeps and adjoint warnings
+
+If the simulator cuts a report step into smaller steps, the adjoint needs the
+state after each of these substeps. Run the base simulation with
+`output_substates = true` in `simulate_reservoir`, so that the result stores
+them, before computing the adjoint.
+
+Treat a warning printed during the adjoint computation as an error until it is
+explained. A warning that some steps have no matching states, for example,
+means that the adjoint was computed with the wrong states. The resulting
+gradient can look plausible and still be wrong.
+
 ### Derived quantities may be missing from the gradient
 
 An input parameter such as permeability often enters the discrete equations
@@ -263,6 +275,11 @@ plateau usually reflects solver tolerances. To test this, repeat the comparison
 with tightened nonlinear and linear tolerances. The plateau level is an estimate
 of how accurately the gradient can be verified.
 
+Judge the check errors against this estimate, not against a tolerance chosen in
+advance. If the errors stay well above the plateau reached with tightened
+tolerances, the gradient contains an error to be found, even when the errors
+look small.
+
 If two components differ by less than this accuracy, do not claim that one of
 them is larger. Report both.
 
@@ -341,11 +358,11 @@ be resolved, report the result as not validated and state what was checked.
 For a typical sensitivity request:
 
 1. Inspect or construct the forward case.
-2. Validate and run it.
+2. Validate and run it, storing substates for the adjoint.
 3. Define the scalar objective `J` and check its sign against its physical meaning.
 4. Identify parameter `p` and parameterization.
 5. Locate the installed adjoint API.
-6. Compute the gradient and check its dimensions and numerical sanity.
+6. Compute the gradient, treat any adjoint warning as an error, and check its dimensions and numerical sanity.
 7. Check whether derived quantities such as well indices are included, and correct or report this.
 8. Convert or normalize the gradient when useful.
 9. Verify the largest entries, an entry close to zero and the well cells, each from a rebuilt case.

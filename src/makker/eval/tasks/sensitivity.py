@@ -63,7 +63,9 @@ LOOSE = REFERENCE_ROOT / "loose"
 # The T6 region (x and y index at most this value), chosen in the reference script.
 _REGION_MAX = int(json.loads((BASE / "reference.json").read_text(encoding="utf-8"))["region_x_max"])
 
-_LIMITS = {"time_limit": 3600, "token_limit": 3_000_000, "message_limit": 160}
+# The time limit is the binding one. Cache reads make up most of the tokens, so
+# the token and message limits only guard against runaway runs (pilot, Nov 2026).
+_LIMITS = {"time_limit": 3600, "token_limit": 15_000_000, "message_limit": 500}
 
 # ---------------------------------------------------------------------------
 # Prompt building blocks.
@@ -108,6 +110,8 @@ def _output_spec(extra: str = "") -> str:
         "`validated` (true if you consider the reported gradient verified, "
         "false otherwise), `checks` (list describing any checks you performed) "
         f"and `limitations` (text){extra}.\n"
+        "Write both files from your Julia session using the computed values, "
+        "not by typing the values in.\n"
     )
 
 

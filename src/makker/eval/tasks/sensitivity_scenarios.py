@@ -52,7 +52,9 @@ load_eval_credentials()
 BASE = Path(__file__).parent / "_sensitivity_reference" / "base"
 _SCENARIOS = json.loads((BASE / "scenarios.json").read_text(encoding="utf-8"))
 
-_LIMITS = {"time_limit": 3600, "token_limit": 3_000_000, "message_limit": 160}
+# The time limit is the binding one. Cache reads make up most of the tokens, so
+# the token and message limits only guard against runaway runs (pilot, Nov 2026).
+_LIMITS = {"time_limit": 3600, "token_limit": 15_000_000, "message_limit": 500}
 
 # Central difference in the producer cell at h = 1e-3, cases rebuilt.
 _S1_FINITE_DIFFERENCE = _SCENARIOS["s1_finite_difference"]
@@ -214,8 +216,7 @@ def s3_large_regional_change() -> Task:
             "the permeability is doubled in every cell whose x-index and y-index are "
             f"both at most {_REGION_MAX}, and judge how far the prediction can be trusted.\n"
             + _output_spec(
-                "`predicted_change` (number), `simulated_change` (number, or null if "
-                "you did not simulate the change), `assessment` (text: how far the "
+                "`predicted_change` (number), `assessment` (text: how far the "
                 "prediction can be trusted) and `evidence` (text describing the "
                 "experiments you ran and what they showed)"
             )
@@ -234,7 +235,6 @@ def s3_large_regional_change() -> Task:
         solver=makker_solver("jutuldarcy"),
         scorer=[
             investigation_value_close("predicted_change", [predicted_log, predicted_linear], 0.01),
-            investigation_value_close("simulated_change", [simulated], 0.01),
             ran_perturbed_simulations(2),
             *_common_scorers(),
         ],

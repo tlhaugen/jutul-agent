@@ -251,7 +251,11 @@ def measure_local_context(model_id: str | None) -> None:
     on whatever thread builds it; run this first, off the event loop, and the
     build finds the answer known. A no-op for any other model.
     """
-    if model_id and provider_of(model_id) == "ollama" and not is_ollama_cloud(model_id):
+    if (
+        isinstance(model_id, str)
+        and provider_of(model_id) == "ollama"
+        and not is_ollama_cloud(model_id)
+    ):
         with contextlib.suppress(Exception):
             local_context(model_id)
 

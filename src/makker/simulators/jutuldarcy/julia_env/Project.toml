@@ -21,10 +21,12 @@ MultiComponentFlash = "35e5bd01-9722-4017-9deb-64a5d32478ff"
 Bonito = "824d6782-a2ef-11e9-3a09-e5662e0c26f8"
 WGLMakie = "276b4fcb-3e11-5398-bf8b-a0c2d153d008"
 
-# Minimum simulator release supported by the bundled skills.
+# Pinned to the exact releases used for the sensitivity evaluation, so that
+# the eval env's automatic Pkg.update cannot move them during the experiment.
+# Upstream requires Jutul 0.5.9+ and JutulDarcy 0.4.1+.
 [compat]
-Jutul = "0.5.9"
-JutulDarcy = "0.4.1"
+Jutul = "=0.5.9"
+JutulDarcy = "=0.4.1"
 
 # Both deps are Makker's in-env Julia runtime, declared as relative `[sources]`
 # paths so they survive the copy into a workspace. Makker is the shared,

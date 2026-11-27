@@ -6,12 +6,17 @@ full, since JutulDarcy's defaults would otherwise change the discrete J:
 - ``ImmiscibleSystem`` uses 1000 kg/m^3 for both phases in the reservoir unless
   a density model is given, and treats the given densities as surface
   densities only.
-- With the default nonlinear tolerances, J carries an error of about 3e-3
-  relative in this case, and it jumps when a perturbation changes the number
-  of Newton iterations. Adaptive substepping (``timesteps = :auto``) adds
-  further jumps, and so do step cuts when Newton fails to reach tight
-  tolerances within the default 15 iterations. With 50 iterations, every
-  run in the reference work is cut in the same way.
+- The time steps define the discrete problem. With JutulDarcy's adaptive
+  time stepping the case takes 42 ministeps and J differs by about 6e-3
+  relative from the case with the report steps as time steps. With the
+  default limit of 15 Newton iterations, steps are cut (32 instead of 26
+  ministeps), J differs by about 2e-3, and finite differences jump. With
+  ``timesteps = :none`` and 50 iterations, every run in the reference work
+  takes the same 26 ministeps.
+
+The default nonlinear tolerances are accurate enough for this case (J within
+about 7e-7 of a tightly converged run), so the prompts leave them at their
+defaults.
 """
 
 FLUIDS = (
@@ -24,11 +29,10 @@ FLUIDS = (
 SIMULATION = (
     "- Simulation: use the 24 report steps as time steps without adaptive "
     "substepping (`timesteps = :none` in `simulate_reservoir`, so a step is only "
-    "cut if Newton fails to converge), the nonlinear tolerances `tol_cnv = 1e-6` "
-    "and `tol_mb = 1e-10`, and at most 50 Newton iterations per step "
-    "(`max_nonlinear_iterations = 50`).\n"
+    "cut if Newton fails to converge), JutulDarcy's default nonlinear tolerances, "
+    "and at most 50 Newton iterations per step (`max_nonlinear_iterations = 50`).\n"
 )
 
 # The same settings as Julia keyword arguments, for the provided setup scripts.
 SIMULATION_STEPPING = "timesteps = :none, max_nonlinear_iterations = 50"
-SIMULATION_KWARGS = f"{SIMULATION_STEPPING}, tol_cnv = 1e-6, tol_mb = 1e-10"
+SIMULATION_KWARGS = SIMULATION_STEPPING

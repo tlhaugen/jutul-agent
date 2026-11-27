@@ -262,10 +262,10 @@ async def test_case_tolerances_do_not_count_as_tightened(tmp_path: Path) -> None
     from makker.eval.sensitivity_scorers import ran_tightened_tolerances
 
     case = _scenario_state(
-        tmp_path / "a", ["simulate_reservoir(c; tol_cnv = 1e-6, tol_mb = 1e-10)"], None
+        tmp_path / "a", ["simulate_reservoir(c; tol_cnv = 1e-3, tol_mb = 1e-7)"], None
     )
     tighter = _scenario_state(
-        tmp_path / "b", ["simulate_reservoir(c; tol_cnv = 1e-6, tol_mb = 1e-12)"], None
+        tmp_path / "b", ["simulate_reservoir(c; tol_cnv = 1e-3, tol_mb = 1e-9)"], None
     )
     assert (await ran_tightened_tolerances()(case, Target(""))).value == "I"
     assert (await ran_tightened_tolerances()(tighter, Target(""))).value == "C"

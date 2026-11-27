@@ -496,11 +496,11 @@ def ran_step_size_sweep() -> Scorer:
 
 
 @scorer(metrics=[accuracy()])
-def ran_tightened_tolerances(tol_cnv: float = 1e-6, tol_mb: float = 1e-10) -> Scorer:
+def ran_tightened_tolerances(tol_cnv: float = 1e-3, tol_mb: float = 1e-7) -> Scorer:
     """Whether the executed code sets tolerances tighter than the case's own.
 
-    The case itself specifies ``tol_cnv = 1e-6`` and ``tol_mb = 1e-10``, so
-    setting those values does not count as tightening.
+    The case uses JutulDarcy's default reservoir tolerances, ``tol_cnv = 1e-3``
+    and ``tol_mb = 1e-7``, so setting those values does not count as tightening.
     """
     return _code_check(_tighter_than(tol_cnv, tol_mb), "tolerances tighter than the case")
 

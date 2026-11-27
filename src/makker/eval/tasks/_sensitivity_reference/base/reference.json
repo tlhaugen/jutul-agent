@@ -1,14 +1,14 @@
 {
-  "J": 0.12037605973558597,
-  "eps_ref": 7.351564725342115e-8,
+  "J": 0.12037597765682233,
+  "eps_ref": 6.824209652521193e-7,
   "eps": 0.0001,
   "tau": 0.001,
-  "max_abs_gradient": 0.01152722957006577,
+  "max_abs_gradient": 0.011527222089008929,
   "accepted_top_cells": [400],
   "region_x_max": 6,
   "region_y_max": 6,
-  "predicted_change_log": 0.0005388744824777087,
-  "predicted_change_linear": 0.0005653902695221397,
-  "simulated_change": 0.0005451396931592661,
+  "predicted_change_log": 0.0005388744090519265,
+  "predicted_change_linear": 0.0005653901924833781,
+  "simulated_change": 0.0005451373574559271,
   "jutuldarcy_version": "0.4.1"
 }

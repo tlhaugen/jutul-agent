@@ -397,7 +397,14 @@ def compat_ranges(spec: str) -> list[tuple[Version, Version]] | None:
 
     ranges = []
     for part in spec.split(","):
-        part = part.strip().removeprefix("^")
+        part = part.strip()
+        if part.startswith("="):
+            exact = _version(part[1:].strip())
+            if exact is None:
+                return None
+            ranges.append((exact, (exact[0], exact[1], exact[2] + 1)))
+            continue
+        part = part.removeprefix("^")
         low = _version(part)
         if low is None or "-" in part or "+" in part:
             return None

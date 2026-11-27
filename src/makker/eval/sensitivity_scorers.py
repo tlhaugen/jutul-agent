@@ -556,19 +556,19 @@ def judged_ranking_unreliable() -> Scorer:
 
 
 @scorer(metrics=[accuracy()])
-def investigation_value_close(key: str, accepted: list[float], rel_tol: float) -> Scorer:
+def investigation_value_close(field: str, accepted: list[float], rel_tol: float) -> Scorer:
     """Whether a number in the investigation report matches an accepted value."""
 
     async def score(state: TaskState, target: Target) -> Score:
         report = _read_json(state, INVESTIGATION_FILE) or {}
         try:
-            value = float(report[key])
+            value = float(report[field])
         except (KeyError, TypeError, ValueError):
             value = math.nan
         ok = math.isfinite(value) and any(abs(value - a) <= rel_tol * abs(a) for a in accepted)
         return Score(
             value=CORRECT if ok else INCORRECT,
-            explanation=f"{key} = {value}, accepted {accepted} (rel. tol {rel_tol})",
+            explanation=f"{field} = {value}, accepted {accepted} (rel. tol {rel_tol})",
         )
 
     return score

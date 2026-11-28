@@ -116,7 +116,8 @@ def s1_well_cell_disagreement() -> Task:
     sample = Sample(
         id="s1-well-cell-disagreement",
         input=(
-            _CASE + "A colleague computed the log-permeability sensitivity dJ/dlogK for "
+            _CASE + "A colleague computed the log-permeability sensitivity dJ/dlogK "
+            "(natural logarithm) for "
             "this case with JutulDarcy's `reservoir_sensitivities` and checked it "
             "with central finite differences in log-permeability, rebuilding the "
             f"case for each perturbation. The checks agree in cells {_check_cells()} "
@@ -163,7 +164,8 @@ def s2_ambiguous_ranking() -> Task:
     sample = Sample(
         id="s2-ambiguous-ranking",
         input=(
-            _CASE + "A colleague computed the log-permeability sensitivity dJ/dlogK for "
+            _CASE + "A colleague computed the log-permeability sensitivity dJ/dlogK "
+            "(natural logarithm) for "
             f"this case and reports that cell {first} is more sensitive than "
             f"cell {second}.\n\n"
             "Can this ranking be relied on? Investigate, and explain how you reached "

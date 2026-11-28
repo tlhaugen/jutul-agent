@@ -104,7 +104,8 @@ def _output_spec(extra: str = "") -> str:
     return (
         "\nWrite two files to the workspace:\n"
         "- `dJ_dlogK.csv` with the header `cell,dJ_dlogK` and one row per cell, "
-        "using JutulDarcy's cell numbering.\n"
+        "using JutulDarcy's cell numbering, where log is the natural logarithm "
+        "(dJ/dlogK = K dJ/dK).\n"
         "- `sensitivity_report.json` with the fields `J` (number), "
         "`most_sensitive_cells` (list of cell numbers, most sensitive first), "
         "`validated` (true if you consider the reported gradient verified, "

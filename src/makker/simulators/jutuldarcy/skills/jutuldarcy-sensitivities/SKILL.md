@@ -190,6 +190,13 @@ entries of the perforated cells. Map each perforation to its reservoir cell
 from the well definition, and check that the number of well indices equals
 the number of perforated cells before adding the correction.
 
+Alternatively, build the case in a setup function of the permeability and
+differentiate through it with the optimization interface (`Jutul.DictParameters`,
+`free_optimization_parameter!` and `JutulDarcy.parameters_gradient_reservoir`).
+Well indices left at their defaults are then computed from the permeability
+when the case is built, so this gradient includes the well-index term directly.
+The two routes should agree, so one can check the other.
+
 Either apply this correction or report clearly that the gradient holds well
 indices fixed. The directional check in section 7 detects the difference.
 
@@ -201,7 +208,7 @@ expressed in SI units.
 For positive permeability `K`, a log-permeability gradient is often easier to
 interpret:
 
-    dJ/dlogK = K * dJ/dK
+    dJ/dlogK = K * dJ/dK      (natural logarithm)
 
 This represents sensitivity to a relative change in permeability rather than an
 absolute change measured in m².
@@ -229,6 +236,10 @@ including transmissibilities and well indices. Build each perturbed simulation
 from a new case with the perturbed parameter. Do not perturb a parameter array
 inside a model object from an earlier tool call, since that object can still
 hold quantities derived from the unperturbed values.
+
+Run every perturbed simulation with the same time stepping, iteration limit
+and tolerances as the base run, so that all runs solve the same discrete
+problem.
 
 ### Component checks
 
